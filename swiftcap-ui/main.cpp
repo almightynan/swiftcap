@@ -1,6 +1,11 @@
 /*
     you may or may not ask: why did i write UI in C++?
     > to piss off the react devs, that's the aim. [https://youtu.be/watch?v=SRgLA8X5N_4]
+
+    TODO: 
+    -   dont show elapsed time in tray icon after ending recording
+    -   implement screenshot functionality
+    -   modularize this code, it's a mess
 */
 
 #include <wx/wx.h>
@@ -14,6 +19,7 @@
 #include <wx/stdpaths.h>
 #include <wx/display.h>
 #include <wx/artprov.h>
+#include <wx/textfile.h>
 
 // buttons with modern style and disabled/hover overlay
 class ModernButton : public wxButton {
@@ -83,10 +89,28 @@ private:
     wxButton* stopBtn = nullptr;
     wxMenuItem* trayStartItem = nullptr;
     wxMenuItem* trayStopItem = nullptr;
+    wxMenuItem* trayPauseItem = nullptr;
+    wxMenuItem* trayResumeItem = nullptr;
+    wxMenuItem* trayElapsedItem = nullptr;
+    wxTaskBarIcon* trayIcon = nullptr;
+    wxMenu* trayMenu = nullptr;
+    wxTimer* elapsedTimer = nullptr;
+    int elapsedSeconds = 0;
+    bool isPaused = false;
+    bool flashState = false;
+    int playIconTimer = 0;
+    int segmentIndex = 0;
+    std::vector<wxString> segmentFiles;
+    wxString concatListFile;
     void OnStartRecording(wxCommandEvent& event);
     void OnStopRecording(wxCommandEvent& event);
+    void OnPauseRecording(wxCommandEvent& event);
+    void OnResumeRecording(wxCommandEvent& event);
     void OnRecordingEnded(wxProcessEvent& event);
+    void OnElapsedTimer(wxTimerEvent& event);
     void UpdateUIState();
+    void UpdateTrayTooltip();
+    void UpdateTrayIconWithTime();
     wxDECLARE_EVENT_TABLE();
 };
 
@@ -151,31 +175,35 @@ MyFrame::MyFrame(const wxString& title)
     // i chose the current icon because i couldnt find anything else on my pc :^)
     wxIcon icon;
     icon.LoadFile("icon.png", wxBITMAP_TYPE_PNG);
-    wxTaskBarIcon* trayIcon = new wxTaskBarIcon();
-    trayIcon->SetIcon(icon, "SwiftCap");
-
-    // the tray feature kinda sucks as of now, ill rewrite this later
-    wxMenu* trayMenu = new wxMenu();
+    trayIcon = new wxTaskBarIcon();
+    trayMenu = new wxMenu();
+    // elapsed time (disabled, updated live)
+    int mins = elapsedSeconds / 60;
+    int secs = elapsedSeconds % 60;
+    wxString elapsedStr = wxString::Format("Elapsed: %02d:%02d", mins, secs);
+    trayElapsedItem = trayMenu->Append(wxID_ANY, elapsedStr);
+    trayElapsedItem->Enable(false);
+    trayMenu->AppendSeparator();
+    trayStartItem = trayMenu->Append(1001, "&Start Recording", "Start screen recording");
+    trayStopItem = trayMenu->Append(1002, "&Stop Recording", "Stop screen recording");
+    trayPauseItem = trayMenu->Append(1003, "&Pause Recording", "Pause recording");
+    trayResumeItem = trayMenu->Append(1004, "&Resume Recording", "Resume recording");
+    trayMenu->AppendSeparator();
     trayMenu->Append(wxID_EXIT, "&Quit", "Quit the application");
-    trayMenu->Append(1001, "&Start Recording", "Start screen recording");
-    trayMenu->Append(1002, "&Stop Recording", "Stop screen recording");
 
-    // bind the menu to the system tray icon
-    trayIcon->Bind(wxEVT_TASKBAR_LEFT_DOWN, [trayIcon, trayMenu](wxTaskBarIconEvent& event) {
+    trayIcon->Bind(wxEVT_TASKBAR_LEFT_DOWN, [this](wxTaskBarIconEvent& event) {
         trayIcon->PopupMenu(trayMenu);
     });
-
-    // bind the quit menu item to the quit function
-    trayIcon->Bind(wxEVT_MENU, [trayIcon, trayMenu](wxCommandEvent& event) {
+    trayIcon->Bind(wxEVT_MENU, [this](wxCommandEvent& event) { this->OnStartRecording(event); }, 1001);
+    trayIcon->Bind(wxEVT_MENU, [this](wxCommandEvent& event) { this->OnStopRecording(event); }, 1002);
+    trayIcon->Bind(wxEVT_MENU, [this](wxCommandEvent& event) { this->OnPauseRecording(event); }, 1003);
+    trayIcon->Bind(wxEVT_MENU, [this](wxCommandEvent& event) { this->OnResumeRecording(event); }, 1004);
+    trayIcon->Bind(wxEVT_MENU, [this](wxCommandEvent& event) {
         trayIcon->RemoveIcon();
         trayIcon->Destroy();
         wxGetApp().ExitMainLoop();
     }, wxID_EXIT);
     trayIcon->SetIcon(icon, "SwiftCap Frontend");
-
-    // bind start/stop
-    trayIcon->Bind(wxEVT_MENU, [this](wxCommandEvent& event) { this->OnStartRecording(event); }, 1001);
-    trayIcon->Bind(wxEVT_MENU, [this](wxCommandEvent& event) { this->OnStopRecording(event); }, 1002);
     UpdateUIState();
 }
 
@@ -184,7 +212,29 @@ void MyFrame::OnStartRecording(wxCommandEvent& event) {
         wxMessageBox("Recording already in progress.", "SwiftCap", wxICON_INFORMATION);
         return;
     }
-    wxString cmd = "../swiftcap-go/swiftcap record --out out.mp4 --audio on";
+    // add elapsed item if not present
+    if (!trayElapsedItem) {
+        int mins = elapsedSeconds / 60;
+        int secs = elapsedSeconds % 60;
+        wxString elapsedStr = wxString::Format("Elapsed: %02d:%02d", mins, secs);
+        trayElapsedItem = new wxMenuItem(trayMenu, wxID_ANY, elapsedStr);
+        trayElapsedItem->Enable(false);
+        trayMenu->Insert(0, trayElapsedItem);
+    }
+    segmentIndex = 1;
+    segmentFiles.clear();
+    // write concat list in current dir with unique name
+    concatListFile = wxString::Format("concatlist_%ld.txt", wxGetLocalTimeMillis().GetValue());
+    wxFileName segFileName(wxString::Format("out_%d.mp4", segmentIndex));
+    segFileName.MakeAbsolute();
+    segmentFiles.push_back(segFileName.GetFullPath());
+    // get current screen size
+    wxDisplay display(wxDisplay::GetFromWindow(this));
+    wxRect scr = display.IsOk() ? display.GetClientArea() : wxGetClientDisplayRect();
+    int w = scr.GetWidth();
+    int h = scr.GetHeight();
+    wxString regionArg = wxString::Format("--region %dx%d", w, h);
+    wxString cmd = wxString::Format("../swiftcap-go/swiftcap record --out %s --audio on %s", segFileName.GetFullPath(), regionArg);
     recorderProc = new wxProcess(this);
     recorderProc->Redirect();
     recorderPid = wxExecute(cmd, wxEXEC_ASYNC, recorderProc);
@@ -193,20 +243,103 @@ void MyFrame::OnStartRecording(wxCommandEvent& event) {
         delete recorderProc;
         recorderProc = nullptr;
     } else {
-        // bind process end event
         Bind(wxEVT_END_PROCESS, &MyFrame::OnRecordingEnded, this);
+        elapsedSeconds = 0;
+        isPaused = false;
+        if (!elapsedTimer) {
+            elapsedTimer = new wxTimer(this);
+            Bind(wxEVT_TIMER, &MyFrame::OnElapsedTimer, this);
+        }
+        elapsedTimer->Start(1000);
+        UpdateTrayIconWithTime();
         wxMessageBox("Recording started!", "SwiftCap", wxICON_INFORMATION);
         UpdateUIState();
     }
 }
 
 void MyFrame::OnStopRecording(wxCommandEvent& event) {
-    if (!recorderProc || recorderPid == 0) {
+    // allow stop if recording or if paused and there are segments
+    bool canStop = (recorderProc && recorderPid != 0) || (isPaused && !segmentFiles.empty());
+    if (!canStop) {
         wxMessageBox("No recording in progress.", "SwiftCap", wxICON_INFORMATION);
         return;
     }
-    kill(recorderPid, SIGINT);
-    // wxMessageBox("Recording stopped.", "SwiftCap", wxICON_INFORMATION); // removed: only show toast, for now.
+    if (recorderProc && recorderPid != 0) {
+        kill(recorderPid, SIGINT);
+        if (elapsedTimer) elapsedTimer->Stop();
+        UpdateTrayIconWithTime();
+        UpdateUIState();
+    }
+    // generate output filename: recording_YYYYMMDD_HHMMSS.mp4
+    wxDateTime now = wxDateTime::Now();
+    wxString outFileName = wxString::Format("recording_%04d%02d%02d_%02d%02d%02d.mp4",
+        now.GetYear(), now.GetMonth()+1, now.GetDay(), now.GetHour(), now.GetMinute(), now.GetSecond());
+    // concatenate segments
+    wxTextFile concatFile(concatListFile);
+    concatFile.Create();
+    for (const auto& seg : segmentFiles) {
+        wxString absSeg = wxFileName(seg).GetFullPath();
+        concatFile.AddLine(wxString::Format("file '%s'", absSeg));
+    }
+    concatFile.Write();
+    concatFile.Close();
+    wxString concatCmd = wxString::Format("ffmpeg -y -f concat -safe 0 -i %s -c copy %s", concatListFile, outFileName);
+    wxExecute(concatCmd, wxEXEC_SYNC);
+    // optionally, clean up segment files and concat list
+    for (const auto& seg : segmentFiles) wxRemoveFile(seg);
+    wxRemoveFile(concatListFile);
+    // reset state
+    recorderProc = nullptr;
+    recorderPid = 0;
+    isPaused = false;
+    segmentFiles.clear();
+    concatListFile = "";
+    UpdateTrayIconWithTime();
+    UpdateUIState();
+    // show toast
+    Raise();
+    wxFileName outFile(outFileName);
+    outFile.MakeAbsolute();
+    new ToastFrame(this, outFile.GetFullPath());
+}
+
+/*
+    the functions OnPauseRecording and OnResumeRecording are used to pause and 
+    resume the recording. this is by far the best approach to implement pausing
+    and resume recording. if you think you have a better approach, please
+    let me know. i will be happy to hear your suggestions.
+*/
+
+void MyFrame::OnPauseRecording(wxCommandEvent& event) {
+    if (!recorderProc || recorderPid == 0 || isPaused) return;
+    kill(recorderPid, SIGINT); // stop current segment
+    // do not show toast or finalize, just set paused state
+    isPaused = true;
+    if (elapsedTimer) elapsedTimer->Stop();
+    UpdateTrayIconWithTime();
+    UpdateUIState();
+}
+
+void MyFrame::OnResumeRecording(wxCommandEvent& event) {
+    if (!isPaused) return;
+    segmentIndex++;
+    wxFileName segFileName(wxString::Format("out_%d.mp4", segmentIndex));
+    segFileName.MakeAbsolute();
+    segmentFiles.push_back(segFileName.GetFullPath());
+    // get current screen size to pass into cli
+    wxDisplay display(wxDisplay::GetFromWindow(this));
+    wxRect scr = display.IsOk() ? display.GetClientArea() : wxGetClientDisplayRect();
+    int w = scr.GetWidth();
+    int h = scr.GetHeight();
+    wxString regionArg = wxString::Format("--region %dx%d", w, h);
+    wxString cmd = wxString::Format("../swiftcap-go/swiftcap record --out %s --audio on %s", segFileName.GetFullPath(), regionArg);
+    recorderProc = new wxProcess(this);
+    recorderProc->Redirect();
+    recorderPid = wxExecute(cmd, wxEXEC_ASYNC, recorderProc);
+    isPaused = false;
+    if (elapsedTimer) elapsedTimer->Start(1000);
+    playIconTimer = 5; // show play icon for 5 seconds, we dont want it to be there all the time
+    UpdateTrayIconWithTime();
     UpdateUIState();
 }
 
@@ -216,22 +349,117 @@ void MyFrame::OnRecordingEnded(wxProcessEvent& event) {
         recorderProc = nullptr;
     }
     recorderPid = 0;
+    if (elapsedTimer && !isPaused) elapsedTimer->Stop();
+    UpdateTrayIconWithTime();
     UpdateUIState();
     Unbind(wxEVT_END_PROCESS, &MyFrame::OnRecordingEnded, this);
-    // focus the main window
-    Raise();
-    // show toast with file info and actions
-    wxFileName outFile(wxT("out.mp4"));
-    outFile.MakeAbsolute();
-    new ToastFrame(this, outFile.GetFullPath());
 }
 
 void MyFrame::UpdateUIState() {
     bool recording = (recorderProc != nullptr && recorderPid != 0);
-    if (startBtn) startBtn->Enable(!recording);
-    if (stopBtn) stopBtn->Enable(recording);
-    if (trayStartItem) trayStartItem->Enable(!recording);
-    if (trayStopItem) trayStopItem->Enable(recording);
+    if (isPaused) {
+        if (startBtn) startBtn->Enable(false);
+        if (stopBtn) stopBtn->Enable(true);
+        if (trayStartItem) trayStartItem->Enable(false);
+        if (trayStopItem) trayStopItem->Enable(true);
+        if (trayPauseItem) trayPauseItem->Enable(false);
+        if (trayResumeItem) trayResumeItem->Enable(true);
+    } else {
+        if (startBtn) startBtn->Enable(!recording);
+        if (stopBtn) stopBtn->Enable(recording);
+        if (trayStartItem) trayStartItem->Enable(!recording);
+        if (trayStopItem) trayStopItem->Enable(recording);
+        if (trayPauseItem) trayPauseItem->Enable(recording);
+        if (trayResumeItem) trayResumeItem->Enable(false);
+    }
+}
+
+void MyFrame::OnElapsedTimer(wxTimerEvent& event) {
+    if (!isPaused && recorderProc && recorderPid != 0) {
+        ++elapsedSeconds;
+    }
+    UpdateTrayIconWithTime();
+    // update elapsed time in tray menu
+    if (trayElapsedItem) {
+        int mins = elapsedSeconds / 60;
+        int secs = elapsedSeconds % 60;
+        wxString elapsedStr = wxString::Format("Elapsed: %02d:%02d", mins, secs);
+        trayElapsedItem->SetItemLabel(elapsedStr);
+    }
+}
+
+void MyFrame::UpdateTrayTooltip() {
+    if (!trayIcon) return;
+    trayIcon->SetIcon(wxIcon("icon.png", wxBITMAP_TYPE_PNG), "SwiftCap");
+}
+
+void MyFrame::UpdateTrayIconWithTime() {
+    if (!trayIcon) return;
+    wxBitmap baseBmp("icon.png", wxBITMAP_TYPE_PNG);
+    if (!baseBmp.IsOk()) {
+        trayIcon->SetIcon(wxIcon("icon.png", wxBITMAP_TYPE_PNG), "SwiftCap");
+        return;
+    }
+    bool showOverlay = (recorderProc && recorderPid != 0);
+    wxBitmap bmp(baseBmp);
+    if (showOverlay) {
+        wxMemoryDC dc(bmp);
+        int iconW = baseBmp.GetWidth();
+        int iconH = baseBmp.GetHeight();
+        int overlaySize = iconH / 3;
+        int overlayX = iconW - overlaySize - 2;
+        int overlayY = iconH - overlaySize - 2;
+        if (isPaused) {
+            // draw paused icon (two vertical bars) with border to indicate paused state
+            dc.SetPen(wxPen(*wxBLACK, 2));
+            dc.SetBrush(*wxWHITE_BRUSH);
+            int barW = overlaySize / 4;
+            int gap = barW;
+            dc.DrawRectangle(overlayX + gap/2 - 1, overlayY + 1, barW + 2, overlaySize - 2);
+            dc.DrawRectangle(overlayX + barW + gap + gap/2 - 1, overlayY + 1, barW + 2, overlaySize - 2);
+            dc.SetPen(*wxWHITE_PEN);
+            dc.DrawRectangle(overlayX + gap/2, overlayY + 2, barW, overlaySize - 4);
+            dc.DrawRectangle(overlayX + barW + gap + gap/2, overlayY + 2, barW, overlaySize - 4);
+        } else if (playIconTimer > 0) {
+            // draw play icon (triangle) with border to indicate resume state
+            wxPoint pts[3] = {
+                wxPoint(overlayX + 3, overlayY + 2),
+                wxPoint(overlayX + overlaySize - 3, overlayY + overlaySize/2),
+                wxPoint(overlayX + 3, overlayY + overlaySize - 2)
+            };
+            dc.SetPen(wxPen(*wxBLACK, 2));
+            dc.SetBrush(*wxWHITE_BRUSH);
+            dc.DrawPolygon(3, pts);
+            dc.SetPen(*wxWHITE_PEN);
+            dc.SetBrush(*wxWHITE_BRUSH);
+            dc.DrawPolygon(3, pts);
+        } else {
+            // draw flashing red dot with border to indicate recording state
+            if (flashState) {
+                dc.SetPen(wxPen(*wxBLACK, 2));
+                dc.SetBrush(wxBrush(wxColour(220,40,40)));
+                dc.DrawCircle(overlayX + overlaySize/2, overlayY + overlaySize/2, overlaySize/3 + 1);
+                dc.SetPen(*wxTRANSPARENT_PEN);
+                dc.SetBrush(wxBrush(wxColour(220,40,40)));
+                dc.DrawCircle(overlayX + overlaySize/2, overlayY + overlaySize/2, overlaySize/3 - 1);
+            }
+        }
+        dc.SelectObject(wxNullBitmap);
+    }
+    wxIcon icon;
+    icon.CopyFromBitmap(bmp);
+    trayIcon->SetIcon(icon, "SwiftCap");
+    // timer logic for flashing and play icon
+    if (showOverlay) {
+        if (!isPaused && playIconTimer > 0) {
+            playIconTimer--;
+        } else if (!isPaused) {
+            flashState = !flashState;
+        }
+    } else {
+        playIconTimer = 0;
+        flashState = false;
+    }
 }
 
 wxBEGIN_EVENT_TABLE(MyFrame, wxFrame)
@@ -318,14 +546,14 @@ ToastFrame::ToastFrame(wxWindow* parent, const wxString& filePath)
 #if wxUSE_DISPLAY
     wxDisplay display(wxDisplay::GetFromWindow(parent));
     wxRect scr = display.IsOk() ? display.GetClientArea() : wxGetClientDisplayRect();
-    wxSize sz = bgPanel->GetBestSize();
-    Move(scr.GetRight() - sz.GetWidth() - 4, scr.GetBottom() - sz.GetHeight() - 4);
 #else
     int w, h;
     wxGetDisplaySize(&w, &h);
-    wxSize sz = bgPanel->GetBestSize();
-    Move(w - sz.GetWidth() - 4, h - sz.GetHeight() - 4);
+    wxRect scr(0, 0, w, h);
 #endif
+    Layout();
+    wxSize frameSz = GetSize();
+    Move(scr.GetRight() - frameSz.GetWidth(), scr.GetBottom() - frameSz.GetHeight());
     Show();
     // auto-close after 7 seconds
     m_timer = new wxTimer(this);
