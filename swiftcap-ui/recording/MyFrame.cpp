@@ -1,4 +1,3 @@
-
 #include <wx/app.h>
 #include "../recording/MyFrame.h"
 #include <wx/filename.h>
@@ -92,8 +91,12 @@ void MyFrame::OnStartRecording(wxCommandEvent& event) {
     }
     segmentIndex = 1;
     segmentFiles.clear();
-    concatListFile = wxString::Format("concatlist_%ld.txt", wxGetLocalTimeMillis().GetValue());
-    wxFileName segFileName(wxString::Format("out_%d.mp4", segmentIndex));
+    wxString videosDir = wxStandardPaths::Get().GetUserDir(wxStandardPaths::Dir_Videos);
+    if (!wxDirExists(videosDir)) {
+        wxMkdir(videosDir);
+    }
+    concatListFile = wxFileName(videosDir, wxString::Format("concatlist_%ld.txt", wxGetLocalTimeMillis().GetValue())).GetFullPath();
+    wxFileName segFileName(videosDir, wxString::Format("out_%d.mp4", segmentIndex));
     segFileName.MakeAbsolute();
     segmentFiles.push_back(segFileName.GetFullPath());
     wxDisplay display(wxDisplay::GetFromWindow(this));
@@ -137,20 +140,56 @@ void MyFrame::OnStopRecording(wxCommandEvent& event) {
         UpdateUIState();
     }
     wxDateTime now = wxDateTime::Now();
-    wxString outFileName = wxString::Format("recording_%04d%02d%02d_%02d%02d%02d.mp4",
-        now.GetYear(), now.GetMonth()+1, now.GetDay(), now.GetHour(), now.GetMinute(), now.GetSecond());
-    wxTextFile concatFile(concatListFile);
-    concatFile.Create();
-    for (const auto& seg : segmentFiles) {
-        wxString absSeg = wxFileName(seg).GetFullPath();
-        concatFile.AddLine(wxString::Format("file '%s'", absSeg));
+    wxString videosDir = wxStandardPaths::Get().GetUserDir(wxStandardPaths::Dir_Videos);
+    if (!wxDirExists(videosDir)) {
+        wxMkdir(videosDir);
     }
-    concatFile.Write();
-    concatFile.Close();
-    wxString concatCmd = wxString::Format("ffmpeg -y -loglevel error -f concat -safe 0 -i %s -c copy %s", concatListFile, outFileName);
-    wxExecute(concatCmd, wxEXEC_SYNC);
-    for (const auto& seg : segmentFiles) wxRemoveFile(seg);
-    wxRemoveFile(concatListFile);
+    wxString outFileName = wxFileName(videosDir, wxString::Format("recording_%04d%02d%02d_%02d%02d%02d.mp4",
+        now.GetYear(), now.GetMonth()+1, now.GetDay(), now.GetHour(), now.GetMinute(), now.GetSecond())).GetFullPath();
+    if (!concatListFile.IsEmpty()) {
+        // Debug: check segment files exist
+        wxString missingSegs;
+        for (const auto& seg : segmentFiles) {
+            if (!wxFileExists(seg)) {
+                missingSegs += seg + "\n";
+            }
+        }
+        if (!missingSegs.IsEmpty()) {
+            wxMessageBox("Missing segment files:\n" + missingSegs, "SwiftCap Debug", wxICON_ERROR);
+        }
+        // Debug: check concat file path
+        if (concatListFile.IsEmpty()) {
+            wxMessageBox("Concat list file path is empty!", "SwiftCap Debug", wxICON_ERROR);
+            return;
+        }
+        wxTextFile concatFile(concatListFile);
+        if (!wxFileExists(concatListFile)) {
+            concatFile.Create();
+        }
+        for (const auto& seg : segmentFiles) {
+            wxString absSeg = wxFileName(seg).GetFullPath();
+            concatFile.AddLine(wxString::Format("file '%s'", absSeg));
+        }
+        concatFile.Write();
+        concatFile.Close();
+        wxString concatCmd = wxString::Format("ffmpeg -y -loglevel error -f concat -safe 0 -i %s -c copy %s", concatListFile, outFileName);
+        // Capture ffmpeg output
+        wxArrayString ffmpegOutput, ffmpegErrors;
+        long ffmpegRet = wxExecute(concatCmd, ffmpegOutput, ffmpegErrors, wxEXEC_SYNC);
+        if (!wxFileExists(outFileName)) {
+            wxString errMsg = "ffmpeg failed to create output file!\n";
+            errMsg += "Command: " + concatCmd + "\n";
+            errMsg += "Stdout:\n";
+            for (auto& l : ffmpegOutput) errMsg += l + "\n";
+            errMsg += "Stderr:\n";
+            for (auto& l : ffmpegErrors) errMsg += l + "\n";
+            wxMessageBox(errMsg, "SwiftCap Error", wxICON_ERROR | wxOK);
+        }
+        for (const auto& seg : segmentFiles) {
+            if (wxFileExists(seg)) wxRemoveFile(seg);
+        }
+        if (wxFileExists(concatListFile)) wxRemoveFile(concatListFile);
+    }
     recorderProc = nullptr;
     recorderPid = 0;
     isPaused = false;
