@@ -100,7 +100,7 @@ This produces the `swiftcap_frontend` binary.
 
 ## Packaging
 
-See `swiftcap-go/packaging/README.md` for packaging details and additional notes.
+See `swiftcap-go/README.md` for packaging details and additional notes.
 
 ## Notes
 
