@@ -6,6 +6,79 @@
 #include <wx/artprov.h>
 #include <wx/textfile.h>
 #include <signal.h>
+#include <wx/dcbuffer.h>
+#include <memory>
+
+class CountdownOverlay : public wxFrame {
+public:
+    CountdownOverlay(MyFrame* parent)
+        : wxFrame(nullptr, wxID_ANY, "", wxDefaultPosition, wxDefaultSize,
+                  wxFRAME_NO_TASKBAR | wxSTAY_ON_TOP | wxFRAME_SHAPED | wxBORDER_NONE),
+          m_parent(parent), m_count(3), m_cancelled(false) {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        SetTransparent(200);
+        wxRect scr = wxDisplay((unsigned int)0).GetGeometry();
+        SetSize(scr);
+        Move(scr.GetTopLeft());
+        SetWindowStyleFlag(wxFRAME_NO_TASKBAR | wxSTAY_ON_TOP | wxFRAME_SHAPED | wxBORDER_NONE);
+        Raise();
+        ShowFullScreen(true, wxFULLSCREEN_ALL);
+        SetFocus();
+        AcceptsFocus();
+        Bind(wxEVT_LEFT_DOWN, &CountdownOverlay::OnCancelByClick, this);
+        Bind(wxEVT_RIGHT_DOWN, &CountdownOverlay::OnCancelByClick, this);
+        Bind(wxEVT_MIDDLE_DOWN, &CountdownOverlay::OnCancelByClick, this);
+        Bind(wxEVT_PAINT, &CountdownOverlay::OnPaint, this);
+        m_timer.Bind(wxEVT_TIMER, &CountdownOverlay::OnTimer, this);
+        m_timer.Start(1000);
+    }
+    void OnCancelByClick(wxMouseEvent&) {
+        m_cancelled = true;
+        m_timer.Stop();
+        Hide();
+        if (m_parent) m_parent->CancelPendingRecording();
+        Destroy();
+    }
+    void OnPaint(wxPaintEvent&) {
+        wxAutoBufferedPaintDC dc(this);
+        dc.SetBrush(wxBrush(wxColour(0,0,0,200)));
+        dc.SetPen(*wxTRANSPARENT_PEN);
+        dc.DrawRectangle(GetClientRect());
+        wxFont font(80, wxFONTFAMILY_SWISS, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_BOLD);
+        dc.SetFont(font);
+        dc.SetTextForeground(*wxWHITE);
+        wxString text = wxString::Format("%d", m_count);
+        wxSize sz = dc.GetTextExtent(text);
+        wxSize winSz = GetClientSize();
+        dc.DrawText(text, (winSz.x-sz.x)/2, (winSz.y-sz.y)/2);
+        int blockHeight = 50; // make this dynamic based on taskbar height
+        dc.SetBrush(wxBrush(wxColour(0,0,0)));
+        // dc.SetPen(*wxTRANSPARENT_PEN);
+        dc.DrawRectangle(0, winSz.y-blockHeight, winSz.x, blockHeight);
+        wxFont msgFont(18, wxFONTFAMILY_SWISS, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL);
+        dc.SetFont(msgFont);
+        dc.SetTextForeground(wxColour(220,220,220));
+        wxString msg = "Click anywhere to cancel this countdown and abort recording";
+        wxSize msgSz = dc.GetTextExtent(msg);
+        dc.DrawText(msg, (winSz.x-msgSz.x)/2, winSz.y-blockHeight+(blockHeight-msgSz.y)/2);
+    }
+    void OnTimer(wxTimerEvent&) {
+        m_count--;
+        if (m_count == 0) {
+            m_timer.Stop();
+            Hide();
+            if (!m_cancelled && m_parent) m_parent->StartActualRecording();
+            Destroy();
+        } else {
+            Refresh();
+        }
+    }
+private:
+    MyFrame* m_parent;
+    bool m_cancelled = false;
+    wxTimer m_timer;
+    int m_count;
+};
 
 
 MyFrame::MyFrame(const wxString& title)
@@ -89,6 +162,11 @@ void MyFrame::OnStartRecording(wxCommandEvent& event) {
         trayElapsedItem->Enable(false);
         trayMenu->Insert(0, trayElapsedItem);
     }
+    new CountdownOverlay(this);
+    return;
+}
+
+void MyFrame::StartActualRecording() {
     segmentIndex = 1;
     segmentFiles.clear();
     wxString videosDir = wxStandardPaths::Get().GetUserDir(wxStandardPaths::Dir_Videos);
@@ -100,7 +178,7 @@ void MyFrame::OnStartRecording(wxCommandEvent& event) {
     segFileName.MakeAbsolute();
     segmentFiles.push_back(segFileName.GetFullPath());
     wxDisplay display(wxDisplay::GetFromWindow(this));
-    wxRect scr = display.IsOk() ? display.GetClientArea() : wxGetClientDisplayRect();
+    wxRect scr = display.IsOk() ? display.GetGeometry() : wxGetClientDisplayRect();
     int w = scr.GetWidth();
     int h = scr.GetHeight();
     wxString regionArg = wxString::Format("--region %dx%d", w, h);
@@ -122,7 +200,6 @@ void MyFrame::OnStartRecording(wxCommandEvent& event) {
         }
         elapsedTimer->Start(1000);
         UpdateTrayIconWithTime();
-        wxMessageBox("Recording started!", "SwiftCap", wxICON_INFORMATION);
         UpdateUIState();
     }
 }
@@ -147,7 +224,6 @@ void MyFrame::OnStopRecording(wxCommandEvent& event) {
     wxString outFileName = wxFileName(videosDir, wxString::Format("recording_%04d%02d%02d_%02d%02d%02d.mp4",
         now.GetYear(), now.GetMonth()+1, now.GetDay(), now.GetHour(), now.GetMinute(), now.GetSecond())).GetFullPath();
     if (!concatListFile.IsEmpty()) {
-        // Debug: check segment files exist
         wxString missingSegs;
         for (const auto& seg : segmentFiles) {
             if (!wxFileExists(seg)) {
@@ -157,7 +233,6 @@ void MyFrame::OnStopRecording(wxCommandEvent& event) {
         if (!missingSegs.IsEmpty()) {
             wxMessageBox("Missing segment files:\n" + missingSegs, "SwiftCap Debug", wxICON_ERROR);
         }
-        // Debug: check concat file path
         if (concatListFile.IsEmpty()) {
             wxMessageBox("Concat list file path is empty!", "SwiftCap Debug", wxICON_ERROR);
             return;
@@ -173,7 +248,6 @@ void MyFrame::OnStopRecording(wxCommandEvent& event) {
         concatFile.Write();
         concatFile.Close();
         wxString concatCmd = wxString::Format("ffmpeg -y -loglevel error -f concat -safe 0 -i %s -c copy %s", concatListFile, outFileName);
-        // Capture ffmpeg output
         wxArrayString ffmpegOutput, ffmpegErrors;
         long ffmpegRet = wxExecute(concatCmd, ffmpegOutput, ffmpegErrors, wxEXEC_SYNC);
         if (!wxFileExists(outFileName)) {
@@ -219,7 +293,7 @@ void MyFrame::OnResumeRecording(wxCommandEvent& event) {
     segFileName.MakeAbsolute();
     segmentFiles.push_back(segFileName.GetFullPath());
     wxDisplay display(wxDisplay::GetFromWindow(this));
-    wxRect scr = display.IsOk() ? display.GetClientArea() : wxGetClientDisplayRect();
+    wxRect scr = display.IsOk() ? display.GetGeometry() : wxGetClientDisplayRect();
     int w = scr.GetWidth();
     int h = scr.GetHeight();
     wxString regionArg = wxString::Format("--region %dx%d", w, h);
@@ -346,6 +420,20 @@ void MyFrame::UpdateTrayIconWithTime() {
         playIconTimer = 0;
         flashState = false;
     }
+}
+
+void MyFrame::CancelPendingRecording() {
+    // reset UI state to idle
+    if (elapsedTimer) {
+        elapsedTimer->Stop();
+    }
+    isPaused = false;
+    recorderProc = nullptr;
+    recorderPid = 0;
+    segmentFiles.clear();
+    concatListFile = "";
+    UpdateTrayIconWithTime();
+    UpdateUIState();
 }
 
 wxBEGIN_EVENT_TABLE(MyFrame, wxFrame)

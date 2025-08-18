@@ -1,4 +1,3 @@
-
 // recording/MyFrame.h
 #pragma once
 #include <wx/wx.h>
@@ -13,6 +12,8 @@ class MyFrame : public wxFrame {
 public:
     MyFrame(const wxString& title);
     virtual ~MyFrame() {}
+    void CancelPendingRecording();
+    void StartActualRecording();
 private:
     wxProcess* recorderProc = nullptr;
     long recorderPid = 0;
