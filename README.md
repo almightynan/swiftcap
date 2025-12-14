@@ -1,68 +1,51 @@
 # swiftcap
-swiftcap is aimed to be a lightweight and minimal screen utility tool mainly for linux with cross platform support. 
+swiftcap is a lightweight screen utility tool targeting Linux (with growing cross-platform support). The CLI recorder is designed for speed and low resource usage, while the UI front-end focuses on a simple workflow: countdown, record, pause/resume, and quick access to completed captures.
 
-> swift in swiftcap stands for fast, and cap is a shorter form of capture.
-
-This repository contains two main components:
-
-- **swiftcap-go**: A fast, low-resource, cross-platform screen recorder and screenshot CLI, written in Go. Supports X11, Wayland, and other major platforms.
-- **swiftcap-ui**: A minimal graphical frontend for swiftcap, written in C++ using wxWidgets.
-
-Please note, this project is still in development. A fully downloadable version is still not available. If you would like to try it out and contribute new features, compile from source. Build instructions are given further below. 
+> swift = fast, cap = capture.
 
 ---
 
-## Directory Structure
+## Layout
 
 ```
-swiftcap-go/         # Go CLI tool for screen capture and recording
-    cmd/swiftcap/    # Main entry point for CLI
-    internal/        # Internal packages (cli, detect, execx, ...)
-    packaging/       # Packaging scripts and docs
-    scripts/         # Build and dependency scripts
-
-swiftcap-ui/         # C++ wxWidgets GUI frontend
-    main.cpp         # Main application source
-    Makefile         # Build instructions for the UI
-    swiftcap_ui      # The compiled C++ binary for UI
+cmd/
+    swiftcap/     # CLI entrypoint
+    swiftcap-ui/  # Go desktop UI wrapper around the CLI
+internal/         # Shared packages (cli parsing, portal helpers, recorders, GUI logic, etc.)
+packaging/        # Packaging metadata
+scripts/          # Build helpers
 ```
+
+Everything in this repository is pure Go – no C or C++ sources remain.
 
 ---
 
-## swiftcap-go (CLI)
+## CLI (`cmd/swiftcap`)
 
-### Features
-
-- Record screen or take screenshots via command line.
-- Supports X11 (via ffmpeg) and Wayland (via xdg-desktop-portal).
-- Audio capture (PulseAudio).
-- Region selection, monitor selection, format/container options.
-- Minimal runtime dependencies.
+### Highlights
+- Screen recording via ffmpeg on X11, Wayland screencasting via xdg-desktop-portal.
+- Screenshot capture for X11/Wayland/fallback modes.
+- Audio capture (PulseAudio/PipeWire) with bitrate, region, cursor, thread, and duration controls.
+- Minimal runtime deps beyond ffmpeg + portal stacks.
 
 ### Dependencies
-
 - Go 1.22+
 - ffmpeg
 - gstreamer1.0, gst-plugins-base, gst-plugins-good, gst-plugins-bad
-- xdg-desktop-portal (+ backend)
-- PipeWire
+- xdg-desktop-portal (+ backend) and PipeWire
 
-#### Install dependencies (Debian/Ubuntu):
-
+#### Debian/Ubuntu helper
 ```
-sudo apt install ffmpeg gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad xdg-desktop-portal pipewire
+sudo apt install ffmpeg gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+                 gstreamer1.0-plugins-bad xdg-desktop-portal pipewire
 ```
 
 ### Build
 
-To build a static binary:
-
 ```
-cd swiftcap-go/scripts
-./build_static.sh
+cd scripts
+./build_static.sh   # produces ./swiftcap
 ```
-
-The resulting binary will be `swiftcap` in the `swiftcap-go/` directory.
 
 ### Usage
 
@@ -71,40 +54,40 @@ swiftcap record --out out.mp4 --fps 60 --region 1280x720+0+0 --audio on --contai
 swiftcap screenshot --out shot.png --region 1280x720+0+0 --format png
 ```
 
-Run `swiftcap` with no arguments for full usage and options.
+Run `swiftcap --help` for the full flag set.
 
 ---
 
-## swiftcap-ui (GUI)
+## UI (`cmd/swiftcap-ui`)
 
-### Features
+The UI is now written in Go (Fyne). It wraps the CLI, providing:
 
-- Minimal wxWidgets-based frontend for launching screen capture and screenshot tasks.
-- Calls the `swiftcap` CLI under the hood.
+- Countdown overlay (click to abort) before recording starts.
+- System tray integration with dynamic icons, elapsed timer, start/stop/pause/resume entries.
+- Pause/resume implemented by segmenting recordings and concatenating with ffmpeg on stop.
+- Toast notification inside the app with “Open Folder / Open File”.
+- Same video directory + ffmpeg requirements as the CLI.
 
-### Dependencies
-
-- wxWidgets 3.2+
-- g++ (or compatible C++ compiler)
-
-#### Build
+### Build & run
 
 ```
-cd swiftcap-ui
-make
+go build ./cmd/swiftcap-ui
+./swiftcap-ui
 ```
 
-This produces the `swiftcap_frontend` binary.
+The UI searches for the `swiftcap` CLI in:
+1. `SWIFTCAP_CLI_PATH` (if set),
+2. The same directory as the UI binary,
+3. `$PATH`.
 
 ---
 
 ## Packaging
 
-See `swiftcap-go/README.md` for packaging details and additional notes.
-
-## Notes
-
-- The CLI is the primary interface; the GUI is optional and minimal.
-- For bug reports or contributions, please open an issue or pull request.
+Packaging metadata lives under `packaging/`. See `scripts/` for static build helpers and dependency checks.
 
 ---
+
+## Contributing
+
+Open issues/PRs for bugs or feature ideas. Please make sure `go test ./...` and linting pass before submitting.
