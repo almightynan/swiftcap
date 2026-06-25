@@ -1,0 +1,39 @@
+# Binaries
+swiftcap
+swiftcap-ui
+cmd/swiftcap-ui/swiftcap
+cmd/swiftcap-ui/swiftcap-ui
+
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor/
+
+# Go workspace
+go.work
+go.work.sum
+
+# AI tool directories
+.claude/
+.codex/
+.cursor/
+.aider*
+.continue/
+.copilot/
+.github/copilot*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

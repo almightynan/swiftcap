@@ -88,9 +88,14 @@ func FFmpegCmd(display string, region string, fps int, out string, audio bool, a
 	}
 
 	// ── Output container ───────────────────────────────────────────────────────
-	if container == "mkv" {
+	switch container {
+	case "mkv":
 		args = append(args, "-f", "matroska")
-	} else {
+	case "mov":
+		args = append(args, "-f", "mov")
+	case "avi":
+		args = append(args, "-f", "avi")
+	default:
 		args = append(args, "-f", "mp4", "-movflags", "+faststart")
 	}
 

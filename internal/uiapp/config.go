@@ -15,20 +15,29 @@ type RecordingConfig struct {
 	Threads   int
 	QP        int
 	Nice      int
+
+	RecordDelay int    // seconds to wait before recording starts, 0 = no delay
+	ShotDelay   int    // seconds to wait before screenshot, 0 = no delay
+	ShotFormat  string // "png" or "jpg"
+	ShotCursor  bool   // show cursor in screenshots
 }
 
 func NewRecordingConfig() *RecordingConfig {
 	return &RecordingConfig{
-		FPS:       30,
-		Bitrate:   4000,
-		Audio:     true,
-		Cursor:    true,
-		Container: "mp4",
-		Region:    "",
-		MaxDur:    0,
-		Threads:   0,
-		QP:        0,
-		Nice:      0,
+		FPS:         30,
+		Bitrate:     4000,
+		Audio:       true,
+		Cursor:      true,
+		Container:   "mp4",
+		Region:      "",
+		MaxDur:      0,
+		Threads:     0,
+		QP:          0,
+		Nice:        0,
+		RecordDelay: 0,
+		ShotDelay:   0,
+		ShotFormat:  "png",
+		ShotCursor:  true,
 	}
 }
 
@@ -152,4 +161,50 @@ func (c *RecordingConfig) SetNice(v int) {
 	c.Nice = v
 }
 
+func (c *RecordingConfig) GetRecordDelay() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.RecordDelay
+}
 
+func (c *RecordingConfig) SetRecordDelay(v int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.RecordDelay = v
+}
+
+func (c *RecordingConfig) GetShotDelay() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.ShotDelay
+}
+
+func (c *RecordingConfig) SetShotDelay(v int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ShotDelay = v
+}
+
+func (c *RecordingConfig) GetShotFormat() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.ShotFormat
+}
+
+func (c *RecordingConfig) SetShotFormat(v string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ShotFormat = v
+}
+
+func (c *RecordingConfig) GetShotCursor() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.ShotCursor
+}
+
+func (c *RecordingConfig) SetShotCursor(v bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ShotCursor = v
+}

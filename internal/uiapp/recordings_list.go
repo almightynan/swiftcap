@@ -2,12 +2,14 @@ package uiapp
 
 import (
 	"fmt"
+	"image/color"
 	_ "image/jpeg"
 	_ "image/png"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -39,9 +41,9 @@ func newRecordingsList(videosDir string, onSelect func(path string)) *recordings
 		items:    []recordingItem{},
 	}
 	
-	rl.grid = container.NewGridWithColumns(4)
+	rl.grid = container.NewGridWithColumns(2)
 	rl.scroll = container.NewScroll(rl.grid)
-	rl.scroll.SetMinSize(fyne.NewSize(0, 360))
+	rl.scroll.SetMinSize(fyne.NewSize(0, 260))
 	
 	rl.refresh(videosDir)
 	return rl
@@ -129,8 +131,8 @@ func (rl *recordingsList) createCard(item recordingItem) fyne.CanvasObject {
 		img = canvas.NewImageFromResource(nil)
 	}
 	img.FillMode = canvas.ImageFillStretch
-	img.SetMinSize(fyne.NewSize(180, 102))
-	thumbBg := canvas.NewRectangle(blendColor(bentoSurface, accentSky, 0.06))
+	img.SetMinSize(fyne.NewSize(160, 90))
+	thumbBg := canvas.NewRectangle(color.NRGBA{0x1a, 0x1a, 0x1a, 0xff})
 	thumbBg.StrokeColor = bentoBorder
 	thumbBg.StrokeWidth = 1
 	thumb := container.NewMax(thumbBg, img)
@@ -214,9 +216,9 @@ func generateThumbnail(videoPath string) string {
 }
 
 func isVideoFile(name string) bool {
-	ext := filepath.Ext(name)
-	videoExts := []string{".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv"}
-	for _, e := range videoExts {
+	ext := strings.ToLower(filepath.Ext(name))
+	exts := []string{".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".png", ".jpg", ".jpeg", ".webp"}
+	for _, e := range exts {
 		if ext == e {
 			return true
 		}

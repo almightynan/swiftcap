@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -50,6 +51,20 @@ type RecordingUI struct {
 	audioToggle   *widget.Check
 	cursorToggle  *widget.Check
 	containerSelect *widget.Select
+
+	captureMode   int  // 0 = recording, 1 = screenshot
+	recordPanel   *fyne.Container
+	shotPanel     *fyne.Container
+	shotActionBtn *widget.Button
+	pauseBtn      *widget.Button
+	elapsedLabel  *widget.Label
+
+	sidebarBgObj    *canvas.Rectangle
+	sidebarScroll   fyne.CanvasObject
+	collapseBtn     *widget.Button
+	sidebarExpanded bool
+	widthEnforcer   fyne.CanvasObject
+	actionBtn       *widget.Button
 
 	desktopApp    desktop.App
 	toast         *toastHandle
@@ -92,7 +107,7 @@ var (
 
 func Run() error {
 	application := app.NewWithID("swiftcap-ui")
-	application.Settings().SetTheme(theme.LightTheme())
+	application.Settings().SetTheme(theme.DarkTheme())
 	ui := newRecordingUI(application)
 	ui.buildMainWindow()
 	ui.refreshUI()
@@ -115,11 +130,10 @@ func newRecordingUI(a fyne.App) *RecordingUI {
 func (ui *RecordingUI) buildMainWindow() {
 	win := ui.app.NewWindow("SwiftCap")
 	win.SetIcon(baseAppIcon())
-	win.Resize(fyne.NewSize(1080, 760))
+	win.Resize(fyne.NewSize(800, 640))
 	win.SetFixedSize(false)
 	win.CenterOnScreen()
-	
-	// Handle window close - hide instead of quit
+
 	win.SetCloseIntercept(func() {
 		ui.mu.Lock()
 		ui.windowVisible = false
@@ -128,26 +142,133 @@ func (ui *RecordingUI) buildMainWindow() {
 		ui.updateTray()
 	})
 
-	title := canvas.NewText("SwiftCap", color.NRGBA{0x18, 0x1b, 0x20, 0xff})
-	title.Alignment = fyne.TextAlignLeading
-	title.TextSize = 32
-	title.TextStyle = fyne.TextStyle{Bold: true}
-	desc := widget.NewLabel("Bento-styled screen capture for fast, focused recordings")
-	desc.Wrapping = fyne.TextWrapWord
-	desc.Importance = widget.LowImportance
+	// ── Sidebar ──────────────────────────────────────────────────────────────
 
-	// Control buttons
-	ui.startBtn = widget.NewButton("Start Recording", func() {
-		go ui.handleStart()
-	})
-	ui.startBtn.Importance = widget.HighImportance
-	
-	ui.stopBtn = widget.NewButton("Stop", func() {
+	ui.statusDot = canvas.NewCircle(statusReadyColor)
+	ui.statusDot.StrokeWidth = 0
+	dotWrap := container.NewGridWrap(fyne.NewSize(10, 10), ui.statusDot)
+	ui.statusText = widget.NewLabel("Ready")
+	ui.statusText.TextStyle = fyne.TextStyle{Bold: true}
+	statusRow := container.NewHBox(dotWrap, ui.statusText)
+
+	ui.elapsedLabel = widget.NewLabel("00:00")
+	ui.elapsedLabel.TextStyle = fyne.TextStyle{Monospace: true}
+
+	ui.stopBtn = widget.NewButtonWithIcon("Stop", theme.MediaStopIcon(), func() {
 		go ui.handleStop()
 	})
+	ui.stopBtn.Importance = widget.DangerImportance
 	ui.stopBtn.Disable()
 
-	openFolderBtn := widget.NewButton("Open Videos", func() {
+	ui.pauseBtn = widget.NewButtonWithIcon("Pause", theme.MediaPauseIcon(), func() {
+		ui.mu.Lock()
+		paused := ui.isPaused
+		ui.mu.Unlock()
+		if paused {
+			go ui.handleResume()
+		} else {
+			go ui.handlePause()
+		}
+	})
+	ui.pauseBtn.Importance = widget.LowImportance
+	ui.pauseBtn.Disable()
+
+	// Recording settings panel
+	ui.audioToggle = widget.NewCheck("Audio", func(b bool) { ui.config.SetAudio(b) })
+	ui.cursorToggle = widget.NewCheck("Show cursor", func(b bool) { ui.config.SetCursor(b) })
+
+	recDelayStepper := newNumericStepper(ui.config.GetRecordDelay(), 0, 60, func(n int) {
+		ui.config.SetRecordDelay(n)
+	})
+
+	ui.containerSelect = widget.NewSelect([]string{"mp4", "mkv", "mov", "avi"}, func(s string) {
+		ui.config.SetContainer(s)
+		ui.refreshConfigSummary()
+	})
+	ui.containerSelect.SetSelected(ui.config.GetContainer())
+
+	ui.regionLabel = widget.NewLabel("Full Screen")
+	ui.regionLabel.TextStyle = fyne.TextStyle{Monospace: true}
+
+	selectAreaBtn := widget.NewButtonWithIcon("Select Area", theme.ViewRestoreIcon(), func() { ui.selectRegion() })
+	selectAreaBtn.Importance = widget.LowImportance
+	fullScreenBtn := widget.NewButtonWithIcon("Full Screen", theme.ViewFullScreenIcon(), func() { ui.clearRegion() })
+	fullScreenBtn.Importance = widget.LowImportance
+
+	ui.configSummary = widget.NewLabel("")
+	ui.configSummary.Wrapping = fyne.TextWrapWord
+
+	ui.recordPanel = container.NewVBox(
+		widget.NewLabelWithStyle("Recording", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		widget.NewSeparator(),
+		ui.cursorToggle,
+		ui.audioToggle,
+		container.NewBorder(nil, nil, widget.NewLabel("Delay"), nil, recDelayStepper),
+		container.NewBorder(nil, nil, widget.NewLabel("Format"), nil, ui.containerSelect),
+		widget.NewLabel("Region"),
+		container.NewVBox(selectAreaBtn, fullScreenBtn),
+		ui.regionLabel,
+	)
+
+	// Screenshot settings panel
+	shotCursorCheck := widget.NewCheck("Show cursor", func(b bool) { ui.config.SetShotCursor(b) })
+	shotCursorCheck.SetChecked(ui.config.GetShotCursor())
+
+	shotDelayStepper := newNumericStepper(ui.config.GetShotDelay(), 0, 60, func(n int) {
+		ui.config.SetShotDelay(n)
+	})
+
+	shotFmtSelect := widget.NewSelect([]string{"png", "jpg", "webp", "bmp"}, func(s string) { ui.config.SetShotFormat(s) })
+	shotFmtSelect.SetSelected(ui.config.GetShotFormat())
+
+	ui.shotPanel = container.NewVBox(
+		widget.NewLabelWithStyle("Screenshot", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		widget.NewSeparator(),
+		shotCursorCheck,
+		container.NewBorder(nil, nil, widget.NewLabel("Delay"), nil, shotDelayStepper),
+		container.NewBorder(nil, nil, widget.NewLabel("Format"), nil, shotFmtSelect),
+	)
+	ui.shotPanel.Hide()
+
+	// widthEnforcer lives in the OUTER VBox so Border layout sees the min width.
+	// VScroll does not propagate content min-width, so putting it inside the scroll
+	// had no effect on the sidebar column width.
+	sidebarInner := container.NewVBox(
+		statusRow,
+		ui.elapsedLabel,
+		container.NewGridWithColumns(2, ui.stopBtn, ui.pauseBtn),
+		widget.NewSeparator(),
+		ui.recordPanel,
+		ui.shotPanel,
+	)
+
+	sidebarScrollObj := container.NewVScroll(container.NewPadded(sidebarInner))
+	ui.sidebarScroll = sidebarScrollObj
+
+	ui.sidebarBgObj = canvas.NewRectangle(sidebarBgColor)
+	ui.sidebarExpanded = true
+	ui.widthEnforcer = newWidthSpacer(230)
+
+	ui.collapseBtn = widget.NewButtonWithIcon("", theme.NavigateBackIcon(), func() {
+		ui.toggleSidebar()
+	})
+	ui.collapseBtn.Importance = widget.LowImportance
+
+	// NewVBox doesn't stretch its children — the scroll would only get its min
+	// height and leave a dead gap. NewBorder gives the scroll all remaining space.
+	sidebarTop := container.NewVBox(ui.collapseBtn, ui.widthEnforcer)
+	sidebar := container.NewStack(
+		ui.sidebarBgObj,
+		container.NewBorder(sidebarTop, nil, nil, nil, sidebarScrollObj),
+	)
+
+	// ── Main area ────────────────────────────────────────────────────────────
+
+	appTitle := canvas.NewText("SwiftCap", color.NRGBA{0xff, 0xff, 0xff, 0xff})
+	appTitle.TextSize = 22
+	appTitle.TextStyle = fyne.TextStyle{Bold: true}
+
+	openFolderBtn := widget.NewButtonWithIcon("", theme.FolderOpenIcon(), func() {
 		dir, err := ui.ensureVideosDir()
 		if err != nil {
 			ui.showError("Videos", err.Error())
@@ -157,123 +278,165 @@ func (ui *RecordingUI) buildMainWindow() {
 			ui.showError("Open Folder", err.Error())
 		}
 	})
-	settingsBtn := widget.NewButton("Settings", func() {
-		ui.showSettings()
-	})
-	statusBadge := ui.buildStatusBadge()
-	recordControls := container.NewVBox(
-		statusBadge,
-		container.NewHBox(ui.startBtn, ui.stopBtn),
-		openFolderBtn,
-	)
-	recordCard := bentoCard("Recording", "Start, stop, and manage outputs", accentMint, recordControls)
+	openFolderBtn.Importance = widget.LowImportance
+	settingsBtn := widget.NewButtonWithIcon("", theme.SettingsIcon(), func() { ui.showSettings() })
+	settingsBtn.Importance = widget.LowImportance
 
-	ui.regionLabel = widget.NewLabel("")
-	ui.regionLabel.TextStyle = fyne.TextStyle{Monospace: true}
-	ui.regionLabel.Wrapping = fyne.TextWrapWord
-	selectRegionBtn := widget.NewButton("Select Area", func() {
-		ui.selectRegion()
-	})
-	clearRegionBtn := widget.NewButton("Full Screen", func() {
-		ui.clearRegion()
-	})
-	regionHint := widget.NewLabel("Select Area uses slop for true overlay selection when available.")
-	regionHint.Wrapping = fyne.TextWrapWord
-	regionHint.Importance = widget.LowImportance
-	captureContent := container.NewVBox(
-		ui.regionLabel,
-		container.NewHBox(selectRegionBtn, clearRegionBtn),
-		regionHint,
+	mainHeader := container.NewBorder(nil, nil,
+		appTitle,
+		container.NewHBox(openFolderBtn, settingsBtn),
 	)
-	captureCard := bentoCard("Capture Area", "Choose the portion of the screen", accentSky, captureContent)
 
-	ui.audioToggle = widget.NewCheck("Record audio", func(checked bool) {
-		ui.config.SetAudio(checked)
+	seg := NewSegControl([]SegItem{
+		{Icon: theme.MediaRecordIcon(), Label: "Record"},
+		{Icon: theme.FileImageIcon(), Label: "Capture"},
+	}, func(idx int) {
+		ui.setMode(idx)
 	})
-	ui.cursorToggle = widget.NewCheck("Show cursor", func(checked bool) {
-		ui.config.SetCursor(checked)
-	})
-	formatLabel := widget.NewLabel("Format")
-	ui.containerSelect = widget.NewSelect([]string{"mp4", "mkv"}, func(selected string) {
-		ui.config.SetContainer(selected)
-		ui.refreshConfigSummary()
-	})
-	ui.containerSelect.SetSelected(ui.config.GetContainer())
-	ui.configSummary = widget.NewLabel("")
-	ui.configSummary.Wrapping = fyne.TextWrapWord
-	ui.configSummary.Importance = widget.LowImportance
-	quickContent := container.NewVBox(
-		ui.audioToggle,
-		ui.cursorToggle,
-		container.NewBorder(nil, nil, formatLabel, nil, ui.containerSelect),
-		ui.configSummary,
-		settingsBtn,
-	)
-	quickCard := bentoCard("Quick Controls", "Audio, cursor, and format", accentCoral, quickContent)
 
-	// Recordings list
+	// Single action button — text/icon swaps instantly when mode changes.
+	ui.actionBtn = widget.NewButtonWithIcon("  Start Recording", theme.MediaRecordIcon(), func() {
+		if ui.captureMode == 0 {
+			go ui.handleStart()
+		} else {
+			go ui.handleScreenshot()
+		}
+	})
+	ui.actionBtn.Importance = widget.HighImportance
+
 	videosDir, _ := ui.ensureVideosDir()
 	ui.recordingsList = newRecordingsList(videosDir, func(path string) {
 		if err := openFileFromToast(path); err != nil {
 			ui.showError("Open File", err.Error())
 		}
 	})
-	recordingsCard := bentoCard("Recent Recordings", "Latest captures and exports", accentSun, ui.recordingsList.getContainer())
 
-	header := container.NewVBox(title, desc)
-	topRow := container.NewGridWithColumns(3, recordCard, captureCard, quickCard)
-	content := container.NewVBox(
-		header,
-		topRow,
-		recordingsCard,
+	// Use Border layout so the recordings list stretches to fill remaining height.
+	mainTop := container.NewVBox(
+		mainHeader,
+		widget.NewSeparator(),
+		container.NewPadded(container.NewPadded(seg)),
+		container.NewPadded(ui.actionBtn),
+		widget.NewSeparator(),
+		container.NewPadded(
+			widget.NewLabelWithStyle("Recent Captures", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		),
 	)
+	mainContent := container.NewBorder(mainTop, nil, nil, nil, ui.recordingsList.getContainer())
 
-	background := newAmbientBackground()
-	fadeOverlay := canvas.NewRectangle(color.NRGBA{0xff, 0xff, 0xff, 0xff})
-	win.SetContent(container.NewStack(background, container.NewPadded(content), fadeOverlay))
+	root := container.NewBorder(nil, nil, sidebar, nil, container.NewPadded(mainContent))
+	win.SetContent(root)
 	ui.mainWin = win
 	ui.windowVisible = true
 	ui.syncQuickControls()
 	ui.updateRegionLabel()
 	ui.refreshConfigSummary()
 	win.Show()
-	ui.fadeOverlay(fadeOverlay)
 }
 
-func (ui *RecordingUI) buildStatusBadge() fyne.CanvasObject {
-	ui.statusText = widget.NewLabel("Ready")
-	ui.statusText.TextStyle = fyne.TextStyle{Bold: true}
-	ui.statusDot = canvas.NewCircle(statusReadyColor)
-	ui.statusDot.StrokeWidth = 0
-
-	dotWrap := container.NewGridWrap(fyne.NewSize(10, 10), ui.statusDot)
-	row := container.NewHBox(dotWrap, ui.statusText)
-
-	bg := canvas.NewRectangle(blendColor(bentoSurface, accentMint, 0.18))
-	bg.StrokeColor = bentoBorder
-	bg.StrokeWidth = 1
-
-	return container.NewPadded(container.NewStack(bg, container.NewPadded(row)))
-}
-
-func (ui *RecordingUI) fadeOverlay(overlay *canvas.Rectangle) {
-	if overlay == nil {
-		return
-	}
-	go func() {
-		steps := 12
-		for i := 0; i <= steps; i++ {
-			alpha := uint8(255 - (i * 255 / steps))
-			ui.runOnMain(func() {
-				overlay.FillColor = color.NRGBA{0xff, 0xff, 0xff, alpha}
-				overlay.Refresh()
-				if alpha == 0 {
-					overlay.Hide()
-				}
-			})
-			time.Sleep(40 * time.Millisecond)
+func (ui *RecordingUI) setMode(mode int) {
+	ui.captureMode = mode
+	if mode == 0 {
+		ui.recordPanel.Show()
+		ui.shotPanel.Hide()
+		if ui.actionBtn != nil {
+			ui.actionBtn.SetIcon(theme.MediaRecordIcon())
+			ui.actionBtn.SetText("  Start Recording")
 		}
-	}()
+	} else {
+		ui.recordPanel.Hide()
+		ui.shotPanel.Show()
+		if ui.actionBtn != nil {
+			ui.actionBtn.SetIcon(theme.FileImageIcon())
+			ui.actionBtn.SetText("  Take Screenshot")
+		}
+	}
+}
+
+func (ui *RecordingUI) toggleSidebar() {
+	ui.sidebarExpanded = !ui.sidebarExpanded
+	if ui.sidebarExpanded {
+		ui.sidebarBgObj.Show()
+		ui.sidebarScroll.Show()
+		if ui.widthEnforcer != nil {
+			ui.widthEnforcer.Show()
+		}
+		ui.collapseBtn.SetIcon(theme.NavigateBackIcon())
+	} else {
+		ui.sidebarBgObj.Hide()
+		ui.sidebarScroll.Hide()
+		if ui.widthEnforcer != nil {
+			ui.widthEnforcer.Hide()
+		}
+		ui.collapseBtn.SetIcon(theme.NavigateNextIcon())
+	}
+	if ui.mainWin != nil {
+		ui.mainWin.Content().Refresh()
+	}
+}
+
+// widthSpacer is a transparent widget that enforces a minimum width in a VBox,
+// keeping the sidebar stable when panels switch.
+type widthSpacer struct {
+	widget.BaseWidget
+	w float32
+}
+
+func newWidthSpacer(w float32) *widthSpacer {
+	s := &widthSpacer{w: w}
+	s.ExtendBaseWidget(s)
+	return s
+}
+
+func (s *widthSpacer) MinSize() fyne.Size { return fyne.NewSize(s.w, 1) }
+func (s *widthSpacer) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(canvas.NewRectangle(color.Transparent))
+}
+
+// newNumericStepper returns a [−] [entry] [+] s row clamped to [minVal, maxVal].
+func newNumericStepper(initial, minVal, maxVal int, onChange func(int)) fyne.CanvasObject {
+	v := initial
+	entry := widget.NewEntry()
+	entry.SetText(fmt.Sprintf("%d", v))
+
+	update := func(n int) {
+		if n < minVal {
+			n = minVal
+		}
+		if n > maxVal {
+			n = maxVal
+		}
+		v = n
+		entry.SetText(fmt.Sprintf("%d", v))
+		if onChange != nil {
+			onChange(v)
+		}
+	}
+
+	entry.OnChanged = func(s string) {
+		n, err := strconv.Atoi(s)
+		if err == nil && n >= minVal && n <= maxVal {
+			v = n
+			if onChange != nil {
+				onChange(v)
+			}
+		}
+	}
+
+	decBtn := widget.NewButtonWithIcon("", theme.ContentRemoveIcon(), func() { update(v - 1) })
+	decBtn.Importance = widget.LowImportance
+	incBtn := widget.NewButtonWithIcon("", theme.ContentAddIcon(), func() { update(v + 1) })
+	incBtn.Importance = widget.LowImportance
+
+	return container.NewBorder(nil, nil, decBtn,
+		container.NewHBox(incBtn, widget.NewLabel("s")), entry)
+}
+
+func uiSectionLabel(text string) fyne.CanvasObject {
+	l := widget.NewLabel(strings.ToUpper(text))
+	l.TextStyle = fyne.TextStyle{Bold: true}
+	l.Importance = widget.LowImportance
+	return l
 }
 
 func (ui *RecordingUI) updateStatusIndicator(recording, paused, flash bool) {
@@ -414,8 +577,14 @@ func (ui *RecordingUI) handleStart() {
 		}
 	})
 
+	delay := ui.config.GetRecordDelay()
+	if delay == 0 {
+		go ui.startRecording()
+		return
+	}
+
 	ui.runOnMain(func() {
-		ui.countdown = newCountdownOverlay(ui.app, countdownSeconds, func() {
+		ui.countdown = newCountdownOverlay(ui.app, delay, func() {
 			ui.mu.Lock()
 			ui.countdown = nil
 			ui.mu.Unlock()
@@ -871,9 +1040,24 @@ func (ui *RecordingUI) concatSegments(files []string, listPath string) (string, 
 		return "", fmt.Errorf("failed to close concat list: %w", err)
 	}
 
-	out := filepath.Join(dir, fmt.Sprintf("recording_%s.mp4", time.Now().Format("20060102_150405")))
+	cont := ui.config.GetContainer()
+	if cont == "" {
+		cont = "mp4"
+	}
+	var fmtFlag string
+	switch cont {
+	case "mkv":
+		fmtFlag = "matroska"
+	case "mov":
+		fmtFlag = "mov"
+	case "avi":
+		fmtFlag = "avi"
+	default:
+		fmtFlag = "mp4"
+	}
+	out := filepath.Join(dir, fmt.Sprintf("recording_%s.%s", time.Now().Format("20060102_150405"), cont))
 	var ffmpegOut bytes.Buffer
-	cmd := exec.Command("ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", listPath, "-c", "copy", out)
+	cmd := exec.Command("ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", listPath, "-c", "copy", "-f", fmtFlag, out)
 	cmd.Stdout = &ffmpegOut
 	cmd.Stderr = &ffmpegOut
 	
@@ -1183,6 +1367,7 @@ func (ui *RecordingUI) refreshUI() {
 	paused := ui.isPaused
 	finalizing := ui.finalizing
 	flash := ui.flashState
+	elapsed := ui.elapsedSeconds
 	ui.mu.Unlock()
 
 	ui.runOnMain(func() {
@@ -1192,11 +1377,42 @@ func (ui *RecordingUI) refreshUI() {
 				ui.startBtn.Disable()
 			}
 		}
+		if ui.shotActionBtn != nil {
+			ui.shotActionBtn.Enable()
+			if recording || paused || finalizing {
+				ui.shotActionBtn.Disable()
+			}
+		}
+		if ui.actionBtn != nil {
+			ui.actionBtn.Enable()
+			if recording || paused || finalizing {
+				ui.actionBtn.Disable()
+			}
+		}
 		if ui.stopBtn != nil {
 			if recording || paused || finalizing {
 				ui.stopBtn.Enable()
 			} else {
 				ui.stopBtn.Disable()
+			}
+		}
+		if ui.elapsedLabel != nil {
+			if recording || paused {
+				ui.elapsedLabel.SetText(formatElapsed(elapsed))
+			} else {
+				ui.elapsedLabel.SetText("00:00")
+			}
+		}
+		if ui.pauseBtn != nil {
+			if recording && !paused && !finalizing {
+				ui.pauseBtn.Enable()
+				ui.pauseBtn.SetText("  Pause")
+			} else if paused {
+				ui.pauseBtn.Enable()
+				ui.pauseBtn.SetText("  Resume")
+			} else {
+				ui.pauseBtn.Disable()
+				ui.pauseBtn.SetText("  Pause")
 			}
 		}
 	})
@@ -1325,6 +1541,219 @@ func (ui *RecordingUI) runOnMain(fn func()) {
 	}
 	fn()
 }
+
+// ── Screenshot ──────────────────────────────────────────────────────────────
+
+func (ui *RecordingUI) handleScreenshot() {
+	ui.mu.Lock()
+	if ui.countdown != nil {
+		ui.mu.Unlock()
+		return
+	}
+	ui.mu.Unlock()
+
+	// Hide main window so it doesn't appear in the screenshot
+	ui.runOnMain(func() {
+		if ui.mainWin != nil {
+			ui.mu.Lock()
+			ui.windowVisible = false
+			ui.mu.Unlock()
+			ui.mainWin.Hide()
+		}
+	})
+	time.Sleep(180 * time.Millisecond)
+
+	// Capture the current screen for the overlay background
+	screenW, screenH := getScreenSize()
+	tmpFile := fmt.Sprintf("/tmp/swiftcap_snap_%d.png", time.Now().UnixNano())
+	_ = takeScreenshot(screenW, screenH, tmpFile)
+
+	// Show the snipping overlay on the main thread; block until user selects
+	resultCh := make(chan string, 1)
+	ui.runOnMain(func() {
+		win := ui.app.NewWindow("")
+		win.SetPadded(false)
+		win.SetFixedSize(true)
+		win.SetFullScreen(true)
+
+		overlay := newRegionOverlayWidget(tmpFile, screenW, screenH, func(region string) {
+			win.Close()
+			os.Remove(tmpFile)
+			resultCh <- region
+		})
+		win.SetContent(overlay)
+		win.Canvas().Focus(overlay)
+		win.Show()
+	})
+
+	region := <-resultCh
+
+	if region == "" {
+		// User cancelled — restore the main window
+		ui.runOnMain(func() {
+			if ui.mainWin != nil {
+				ui.mu.Lock()
+				ui.windowVisible = true
+				ui.mu.Unlock()
+				ui.mainWin.Show()
+				ui.mainWin.RequestFocus()
+			}
+		})
+		return
+	}
+
+	// Markup mode produces a pre-composited file rather than a region string.
+	if strings.HasPrefix(region, "file:") {
+		tmpPath := strings.TrimPrefix(region, "file:")
+		ui.saveMarkupCapture(tmpPath)
+		return
+	}
+
+	// Capture the selected region
+	ui.captureScreenshotWithRegion(region)
+}
+
+// saveMarkupCapture moves/converts the pre-composited PNG from markup mode into
+// the configured output directory with the user's format preference.
+func (ui *RecordingUI) saveMarkupCapture(tmpPath string) {
+	defer os.Remove(tmpPath)
+
+	dir, err := ui.ensureVideosDir()
+	if err != nil {
+		ui.runOnMain(func() {
+			if ui.mainWin != nil {
+				ui.mu.Lock()
+				ui.windowVisible = true
+				ui.mu.Unlock()
+				ui.mainWin.Show()
+			}
+		})
+		ui.showError("Screenshot", err.Error())
+		return
+	}
+
+	ext := ui.config.GetShotFormat()
+	if ext == "" {
+		ext = "png"
+	}
+	outPath := filepath.Join(dir, fmt.Sprintf("swiftcap_markup_%d.%s", time.Now().UnixNano(), ext))
+
+	if ext == "png" {
+		if err := os.Rename(tmpPath, outPath); err != nil {
+			// Cross-device rename — fall through to ffmpeg copy
+			cmd := exec.Command("ffmpeg", "-y", "-i", tmpPath, outPath)
+			if err2 := cmd.Run(); err2 != nil {
+				ui.showError("Screenshot", fmt.Sprintf("Failed to save markup: %v", err2))
+				return
+			}
+		}
+	} else {
+		cmd := exec.Command("ffmpeg", "-y", "-i", tmpPath, outPath)
+		if err := cmd.Run(); err != nil {
+			ui.showError("Screenshot", fmt.Sprintf("Failed to convert markup: %v", err))
+			return
+		}
+	}
+
+	ui.runOnMain(func() {
+		if ui.mainWin != nil {
+			ui.mu.Lock()
+			ui.windowVisible = true
+			ui.mu.Unlock()
+			ui.mainWin.Show()
+			ui.mainWin.RequestFocus()
+		}
+		ui.showToast(outPath)
+	})
+	ui.refreshRecordingsList()
+}
+
+func (ui *RecordingUI) captureScreenshotWithRegion(region string) {
+	dir, err := ui.ensureVideosDir()
+	if err != nil {
+		ui.runOnMain(func() {
+			if ui.mainWin != nil {
+				ui.mu.Lock()
+				ui.windowVisible = true
+				ui.mu.Unlock()
+				ui.mainWin.Show()
+			}
+		})
+		ui.showError("Screenshot", err.Error())
+		return
+	}
+
+	ext := ui.config.GetShotFormat()
+	if ext == "" {
+		ext = "png"
+	}
+	path := filepath.Join(dir, fmt.Sprintf("swiftcap_%d.%s", time.Now().UnixNano(), ext))
+
+	display := os.Getenv("DISPLAY")
+	if display == "" {
+		display = ":0.0"
+	}
+
+	cursor := ui.config.GetShotCursor()
+
+	var args []string
+	args = append(args, "-y")
+
+	var vidW, vidH, vidX, vidY int
+	hasRegion := false
+	if region != "" {
+		if n, _ := fmt.Sscanf(region, "%dx%d+%d+%d", &vidW, &vidH, &vidX, &vidY); n == 4 {
+			hasRegion = true
+			if vidW%2 != 0 {
+				vidW--
+			}
+			if vidH%2 != 0 {
+				vidH--
+			}
+			args = append(args, "-video_size", fmt.Sprintf("%dx%d", vidW, vidH))
+		}
+	}
+
+	args = append(args, "-f", "x11grab")
+	if cursor {
+		args = append(args, "-draw_mouse", "1")
+	} else {
+		args = append(args, "-draw_mouse", "0")
+	}
+
+	input := display
+	if hasRegion {
+		input = fmt.Sprintf("%s+%d,%d", display, vidX, vidY)
+	}
+	args = append(args, "-i", input, "-vframes", "1", path)
+
+	cmd := exec.Command("ffmpeg", args...)
+	if err := cmd.Run(); err != nil {
+		ui.runOnMain(func() {
+			if ui.mainWin != nil {
+				ui.mu.Lock()
+				ui.windowVisible = true
+				ui.mu.Unlock()
+				ui.mainWin.Show()
+			}
+		})
+		ui.showError("Screenshot", fmt.Sprintf("Capture failed: %v", err))
+		return
+	}
+
+	ui.runOnMain(func() {
+		if ui.mainWin != nil {
+			ui.mu.Lock()
+			ui.windowVisible = true
+			ui.mu.Unlock()
+			ui.mainWin.Show()
+		}
+		ui.showToast(path)
+	})
+	ui.refreshRecordingsList()
+}
+
+var sidebarBgColor = color.NRGBA{0x1a, 0x1a, 0x1a, 0xff}
 
 // stripANSI removes ANSI terminal escape sequences from s.
 func stripANSI(s string) string {

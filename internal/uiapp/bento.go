@@ -2,7 +2,6 @@ package uiapp
 
 import (
 	"image/color"
-	"math"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -11,13 +10,13 @@ import (
 )
 
 var (
-	bentoSurface = color.NRGBA{0xf7, 0xf8, 0xfa, 0xff}
-	bentoBorder  = color.NRGBA{0xd6, 0xdb, 0xe2, 0xff}
+	bentoSurface = color.NRGBA{0x2a, 0x2a, 0x2a, 0xff}
+	bentoBorder  = color.NRGBA{0x3e, 0x3e, 0x3e, 0xff}
 
-	accentMint  = color.NRGBA{0x76, 0xd4, 0xa4, 0xff}
-	accentSky   = color.NRGBA{0x7b, 0xb8, 0xf1, 0xff}
-	accentCoral = color.NRGBA{0xf1, 0x98, 0x83, 0xff}
-	accentSun   = color.NRGBA{0xf3, 0xc4, 0x6a, 0xff}
+	accentMint  = color.NRGBA{0x3d, 0xd6, 0x8c, 0xff}
+	accentSky   = color.NRGBA{0x5a, 0xa8, 0xe6, 0xff}
+	accentCoral = color.NRGBA{0xf1, 0x74, 0x63, 0xff}
+	accentSun   = color.NRGBA{0xf5, 0xb9, 0x41, 0xff}
 )
 
 func bentoCard(title, subtitle string, accent color.NRGBA, body fyne.CanvasObject) fyne.CanvasObject {
@@ -58,24 +57,6 @@ func bentoAccentDot(accent color.NRGBA) fyne.CanvasObject {
 	return container.NewGridWrap(fyne.NewSize(10, 10), dot)
 }
 
-func newAmbientBackground() *canvas.Raster {
-	warm := color.NRGBA{0xf8, 0xf2, 0xea, 0xff}
-	cool := color.NRGBA{0xe8, 0xf1, 0xf6, 0xff}
-	glow := color.NRGBA{0xff, 0xef, 0xdd, 0xff}
-	return canvas.NewRasterWithPixels(func(x, y, w, h int) color.Color {
-		if w == 0 || h == 0 {
-			return warm
-		}
-		fx := float64(x) / float64(w)
-		fy := float64(y) / float64(h)
-		base := blendColor(warm, cool, (fx+fy)/2)
-		dx := fx - 0.15
-		dy := fy - 0.1
-		dist := math.Sqrt(dx*dx + dy*dy)
-		glowStrength := clamp01(1 - dist/0.6)
-		return blendColor(base, glow, glowStrength*0.25)
-	})
-}
 
 func blendColor(a, b color.NRGBA, t float64) color.NRGBA {
 	t = clamp01(t)
