@@ -78,6 +78,10 @@ func openFolder(path string) error {
 }
 
 func openFile(path string) error {
+	return openFileFromToast(path)
+}
+
+func openFileFromToast(path string) error {
 	if _, err := os.Stat(path); err != nil {
 		return err
 	}

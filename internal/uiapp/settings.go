@@ -59,12 +59,18 @@ func (ui *RecordingUI) showSettings() {
 	// Audio
 	sw.audioCheck = widget.NewCheck("Record Audio", func(checked bool) {
 		sw.config.SetAudio(checked)
+		if sw.ui != nil {
+			sw.ui.syncQuickControls()
+		}
 	})
 	sw.audioCheck.SetChecked(sw.config.GetAudio())
 
 	// Cursor
 	sw.cursorCheck = widget.NewCheck("Show Cursor", func(checked bool) {
 		sw.config.SetCursor(checked)
+		if sw.ui != nil {
+			sw.ui.syncQuickControls()
+		}
 	})
 	sw.cursorCheck.SetChecked(sw.config.GetCursor())
 
@@ -72,22 +78,36 @@ func (ui *RecordingUI) showSettings() {
 	containerLabel := widget.NewLabel("Container:")
 	sw.containerSel = widget.NewSelect([]string{"mp4", "mkv"}, func(selected string) {
 		sw.config.SetContainer(selected)
+		if sw.ui != nil {
+			sw.ui.syncQuickControls()
+			sw.ui.refreshConfigSummary()
+		}
 	})
 	sw.containerSel.SetSelected(sw.config.GetContainer())
 	containerRow := container.NewBorder(nil, nil, containerLabel, nil, sw.containerSel)
 
-	// Region
+	// Region - show current region (read-only display)
 	regionLabel := widget.NewLabel("Region:")
 	sw.regionLabel = widget.NewLabel("Full Screen")
-	sw.regionBtn = widget.NewButton("Select Region", func() {
+	sw.updateRegionLabel()
+	regionInfo := widget.NewLabel("Select Area picks a region; Full Screen clears it.")
+	regionInfo.Wrapping = fyne.TextWrapWord
+	sw.regionBtn = widget.NewButton("Select Area", func() {
 		sw.selectRegion()
 	})
-	clearRegionBtn := widget.NewButton("Clear", func() {
+	clearRegionBtn := widget.NewButton("Full Screen", func() {
 		sw.config.SetRegion("")
 		sw.updateRegionLabel()
+		if sw.ui != nil {
+			sw.ui.updateRegionLabel()
+		}
 	})
 	regionRow := container.NewBorder(nil, nil, regionLabel, nil,
-		container.NewHBox(sw.regionLabel, sw.regionBtn, clearRegionBtn))
+		container.NewVBox(
+			sw.regionLabel,
+			container.NewHBox(sw.regionBtn, clearRegionBtn),
+			regionInfo,
+		))
 
 	// Max Duration
 	maxDurLabel := widget.NewLabel("Max Duration (seconds, 0 = unlimited):")
@@ -151,6 +171,8 @@ func (ui *RecordingUI) showSettings() {
 
 	win.SetOnClosed(func() {
 		ui.settingsWin = nil
+		ui.syncQuickControls()
+		ui.refreshConfigSummary()
 	})
 
 	win.Show()
@@ -166,12 +188,16 @@ func (sw *settingsWindow) updateRegionLabel() {
 }
 
 func (sw *settingsWindow) selectRegion() {
-	selector := newRegionSelector(sw.ui.app, func(region string) {
+	if sw.ui == nil || sw.win == nil {
+		return
+	}
+	selector := newRegionSelector(sw.ui.app, sw.win, func(region string) {
 		sw.config.SetRegion(region)
 		sw.updateRegionLabel()
-	}, func() {
-		// Cancelled
-	})
+		if sw.ui != nil {
+			sw.ui.updateRegionLabel()
+		}
+	}, nil)
 	selector.Show()
 }
 
@@ -205,5 +231,9 @@ func (sw *settingsWindow) save() {
 	if nice, err := strconv.Atoi(sw.niceEntry.Text); err == nil {
 		sw.config.SetNice(nice)
 	}
-}
 
+	if sw.ui != nil {
+		sw.ui.syncQuickControls()
+		sw.ui.refreshConfigSummary()
+	}
+}
