@@ -461,7 +461,20 @@ func (w *regionOverlayWidget) TypedKey(ev *fyne.KeyEvent) {
 		if size.Width > 0 {
 			scale = float32(w.screenW) / size.Width
 		}
-		region := snipComputeRegion(mode, sx, sy, cx, cy, freePoints, scale)
+
+		var region string
+		if mode == snipFreeform && len(freePoints) >= 3 {
+			// Polygon-mask the bgImage directly; no second x11grab needed.
+			if tmpPath, err := saveFreeformTmpFile(w.bgImage, freePoints, scale); err == nil {
+				region = "file:" + tmpPath
+			} else {
+				// Fallback to bounding-box rectangle on error.
+				region = snipComputeRegion(mode, sx, sy, cx, cy, freePoints, scale)
+			}
+		} else {
+			region = snipComputeRegion(mode, sx, sy, cx, cy, freePoints, scale)
+		}
+
 		if w.onDone != nil {
 			w.onDone(region)
 		}

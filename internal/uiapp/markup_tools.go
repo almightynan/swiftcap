@@ -1,11 +1,16 @@
 package uiapp
 
 import (
+	"fmt"
 	"image"
 	"image/color"
 	"image/png"
 	"math"
 	"os"
+	"sort"
+	"time"
+
+	"fyne.io/fyne/v2"
 )
 
 // ── compositing ───────────────────────────────────────────────────────────────
@@ -284,4 +289,110 @@ func mkBoxBlur(img *image.RGBA, bg image.Image, wx0, wy0, wx1, wy1, radius int) 
 			}
 		}
 	}
+}
+
+// ── freeform capture ──────────────────────────────────────────────────────────
+
+// saveFreeformTmpFile crops bgImg to the polygon defined by freePoints (widget
+// logical coords), masks out pixels outside the polygon, and saves a PNG to a
+// temp file.  Returns the file path on success.
+func saveFreeformTmpFile(bgImg image.Image, freePoints []fyne.Position, scale float32) (string, error) {
+	if bgImg == nil || len(freePoints) < 3 {
+		return "", fmt.Errorf("need at least 3 points")
+	}
+
+	// Bounding box in widget coords
+	bMinX, bMinY := freePoints[0].X, freePoints[0].Y
+	bMaxX, bMaxY := bMinX, bMinY
+	for _, p := range freePoints {
+		if p.X < bMinX {
+			bMinX = p.X
+		}
+		if p.Y < bMinY {
+			bMinY = p.Y
+		}
+		if p.X > bMaxX {
+			bMaxX = p.X
+		}
+		if p.Y > bMaxY {
+			bMaxY = p.Y
+		}
+	}
+
+	bgB := bgImg.Bounds()
+	bgW, bgH := bgB.Dx(), bgB.Dy()
+
+	// Bounding box in screen pixel coords (clamped)
+	sx0 := int(bMinX * scale)
+	sy0 := int(bMinY * scale)
+	sx1 := int(bMaxX * scale)
+	sy1 := int(bMaxY * scale)
+	if sx0 < 0 {
+		sx0 = 0
+	}
+	if sy0 < 0 {
+		sy0 = 0
+	}
+	if sx1 > bgW {
+		sx1 = bgW
+	}
+	if sy1 > bgH {
+		sy1 = bgH
+	}
+	cropW := sx1 - sx0
+	cropH := sy1 - sy0
+	if cropW <= 0 || cropH <= 0 {
+		return "", fmt.Errorf("empty region")
+	}
+
+	out := image.NewNRGBA(image.Rect(0, 0, cropW, cropH))
+	n := len(freePoints)
+
+	// Scanline fill: for each row compute x-intersections, copy pixels between pairs.
+	for cy := 0; cy < cropH; cy++ {
+		py := sy0 + cy
+		wy := float32(py) / scale // widget y for this screen row
+
+		var xs []float32
+		for i := 0; i < n; i++ {
+			j := (i + 1) % n
+			yi := freePoints[i].Y
+			yj := freePoints[j].Y
+			if (yi <= wy && yj > wy) || (yj <= wy && yi > wy) {
+				xi := freePoints[i].X
+				xj := freePoints[j].X
+				wx := xi + (wy-yi)*(xj-xi)/(yj-yi)
+				xs = append(xs, wx)
+			}
+		}
+		sort.Slice(xs, func(a, b int) bool { return xs[a] < xs[b] })
+
+		for k := 0; k+1 < len(xs); k += 2 {
+			fillX0 := int(xs[k]*scale) - sx0
+			fillX1 := int(xs[k+1]*scale) - sx0
+			if fillX0 < 0 {
+				fillX0 = 0
+			}
+			if fillX1 > cropW {
+				fillX1 = cropW
+			}
+			for cx := fillX0; cx < fillX1; cx++ {
+				px := sx0 + cx
+				r, g, b, a := bgImg.At(bgB.Min.X+px, bgB.Min.Y+py).RGBA()
+				out.SetNRGBA(cx, cy, color.NRGBA{uint8(r >> 8), uint8(g >> 8), uint8(b >> 8), uint8(a >> 8)})
+			}
+		}
+		xs = xs[:0]
+	}
+
+	tmpOut := fmt.Sprintf("/tmp/swiftcap_freeform_%d.png", time.Now().UnixNano())
+	f, err := os.Create(tmpOut)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	if err := png.Encode(f, out); err != nil {
+		return "", err
+	}
+	return tmpOut, nil
 }
