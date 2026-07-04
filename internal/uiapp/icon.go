@@ -60,49 +60,51 @@ func renderTrayIcon(recording, paused, flash, showPlay bool) fyne.Resource {
 	return fyne.NewStaticResource("swiftcap-tray.png", buf.Bytes())
 }
 
+// drawOverlaySymbol draws a large, centered status glyph so the tray icon makes
+// the recording state obvious at a glance.
 func drawOverlaySymbol(img *image.RGBA, paused, flash, showPlay bool) {
-	overlay := image.Rect(80, 80, 118, 118)
-	draw.Draw(img, overlay, &image.Uniform{color.NRGBA{0x0b, 0x0b, 0x0d, 0xee}}, image.Point{}, draw.Src)
-
 	switch {
 	case paused:
-		drawPauseBars(img, overlay)
+		drawPauseGlyph(img)
 	case showPlay:
-		drawPlayTriangle(img, overlay)
-	case flash:
-		drawRecordCircle(img, overlay, color.NRGBA{0xdc, 0x2a, 0x2a, 0xff})
+		drawPlayGlyph(img)
 	default:
-		drawRecordCircle(img, overlay, color.NRGBA{0xaa, 0x1e, 0x1e, 0xff})
+		drawRecGlyph(img, flash)
 	}
 }
 
-func drawPauseBars(img *image.RGBA, area image.Rectangle) {
-	barWidth := area.Dx() / 4
-	padding := barWidth / 2
-	left := image.Rect(area.Min.X+padding, area.Min.Y+2, area.Min.X+padding+barWidth, area.Max.Y-2)
-	right := image.Rect(area.Max.X-padding-barWidth, area.Min.Y+2, area.Max.X-padding, area.Max.Y-2)
-	draw.Draw(img, left, &image.Uniform{color.NRGBA{0xee, 0xee, 0xee, 0xff}}, image.Point{}, draw.Src)
-	draw.Draw(img, right, &image.Uniform{color.NRGBA{0xee, 0xee, 0xee, 0xff}}, image.Point{}, draw.Src)
-}
-
-func drawPlayTriangle(img *image.RGBA, area image.Rectangle) {
-	points := []image.Point{
-		{area.Min.X + 3, area.Min.Y + 2},
-		{area.Max.X - 3, area.Min.Y + area.Dy()/2},
-		{area.Min.X + 3, area.Max.Y - 2},
+// drawRecGlyph draws a big red record dot that pulses (brighter + larger) on the
+// flash beat, with a dark halo so it stands out on any tray background.
+func drawRecGlyph(img *image.RGBA, flash bool) {
+	const cx, cy = 64, 64
+	fill := color.NRGBA{0xcf, 0x24, 0x22, 0xff}
+	r := 36
+	if flash {
+		fill = color.NRGBA{0xff, 0x40, 0x38, 0xff}
+		r = 41
 	}
-	fillTriangle(img, points, color.NRGBA{0xee, 0xee, 0xee, 0xff})
+	fillCircle(img, cx, cy, r+6, color.NRGBA{0x0b, 0x0b, 0x0d, 0xff})
+	fillCircle(img, cx, cy, r, fill)
 }
 
-func drawRecordCircle(img *image.RGBA, area image.Rectangle, fill color.NRGBA) {
-	size := area.Dx()
-	radius := size / 3
-	cx := area.Min.X + size/2
-	cy := area.Min.Y + size/2
-	for x := -radius; x <= radius; x++ {
-		for y := -radius; y <= radius; y++ {
-			if x*x+y*y <= radius*radius {
-				img.Set(cx+x, cy+y, fill)
+func drawPauseGlyph(img *image.RGBA) {
+	fillCircle(img, 64, 64, 46, color.NRGBA{0x0b, 0x0b, 0x0d, 0xff})
+	bar := color.NRGBA{0xf1, 0xc0, 0x5a, 0xff}
+	draw.Draw(img, image.Rect(46, 40, 60, 88), &image.Uniform{bar}, image.Point{}, draw.Src)
+	draw.Draw(img, image.Rect(68, 40, 82, 88), &image.Uniform{bar}, image.Point{}, draw.Src)
+}
+
+func drawPlayGlyph(img *image.RGBA) {
+	fillCircle(img, 64, 64, 46, color.NRGBA{0x0b, 0x0b, 0x0d, 0xff})
+	pts := []image.Point{{52, 42}, {88, 64}, {52, 86}}
+	fillTriangle(img, pts, color.NRGBA{0x27, 0xb3, 0x72, 0xff})
+}
+
+func fillCircle(img *image.RGBA, cx, cy, r int, col color.NRGBA) {
+	for y := -r; y <= r; y++ {
+		for x := -r; x <= r; x++ {
+			if x*x+y*y <= r*r {
+				img.Set(cx+x, cy+y, col)
 			}
 		}
 	}

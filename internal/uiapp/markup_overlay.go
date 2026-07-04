@@ -42,6 +42,9 @@ const (
 	mkHitBlur1        = 21 // smooth
 	mkHitCapture      = 30
 	mkHitUndo         = 31
+	mkHitExit         = 40 // "Exit Markup" button (top-left)
+	mkHitConfirmYes   = 41 // confirm exit
+	mkHitConfirmNo    = 42 // cancel exit
 	mkHitPalBase      = 100 // +index → palette for stroke color
 	mkHitPalFillBase  = 200 // +index → palette for fill color
 )
@@ -102,13 +105,36 @@ func (w *regionOverlayWidget) mkGeom(sz fyne.Size) (optX, colorX, sizeMinX, size
 func (w *regionOverlayWidget) hitMarkupBar(pos fyne.Position, sz fyne.Size) int {
 	barTopY := w.mkBarTopY(sz)
 
-	// Palette popup is rendered ABOVE the toolbar
 	w.mu.Lock()
 	showPal := w.showPalette
 	palForFill := w.palForFill
 	tool := w.markTool
 	fill := w.markFill
+	showConfirm := w.showExitConfirm
 	w.mu.Unlock()
+
+	// Exit button (top-left) — always hittable in markup mode, even when confirm shows
+	ey := mkExitBtnY()
+	if pos.X >= mkExitBtnX && pos.X < mkExitBtnX+mkExitBtnW &&
+		pos.Y >= ey && pos.Y < ey+mkExitBtnH {
+		return mkHitExit
+	}
+
+	// Confirmation dialog absorbs all non-button clicks
+	if showConfirm {
+		cx2 := sz.Width / 2
+		cy2 := sz.Height / 2
+		btnY := cy2 + confirmBtnOffY
+		if pos.Y >= btnY && pos.Y < btnY+confirmBtnH {
+			if pos.X >= cx2+confirmYesBtnOX && pos.X < cx2+confirmYesBtnOX+confirmBtnW {
+				return mkHitConfirmYes
+			}
+			if pos.X >= cx2+confirmNoBtnOX && pos.X < cx2+confirmNoBtnOX+confirmBtnW {
+				return mkHitConfirmNo
+			}
+		}
+		return mkHitNone
+	}
 
 	if showPal {
 		_, colorX, _, _, _, _, _, _ := w.mkGeom(sz)
@@ -218,14 +244,90 @@ func (w *regionOverlayWidget) hitMarkupBar(pos fyne.Position, sz fyne.Size) int 
 
 // ─── mouse handlers ──────────────────────────────────────────────────────────
 
+// Exit button geometry (top-left pill button)
+const (
+	mkExitBtnX = float32(12)
+	mkExitBtnW = float32(128)
+	mkExitBtnH = float32(36)
+)
+
+func mkExitBtnY() float32 { return tbTopOff + (tbPanelH()-mkExitBtnH)/2 }
+
+// Confirm dialog geometry — all expressed relative to screen centre (cx2, cy2).
+const (
+	confirmCardW    = float32(420)
+	confirmCardH    = float32(170)
+	confirmCardOffY = float32(-85) // cy2 + confirmCardOffY = card top
+	confirmBtnOffY  = float32(23)  // cy2 + confirmBtnOffY  = button row top
+	confirmBtnH     = float32(42)
+	confirmBtnW     = float32(188)
+	confirmYesBtnOX = float32(6)    // cx2 + this = "Discard & Exit" left edge
+	confirmNoBtnOX  = float32(-194) // cx2 + this = "Keep Editing" left edge
+)
+
+// handleMarkupMouseDown handles a mouse-down event in markup mode.
+// When exit is confirmed it sets w.pendingExit = true; MouseUp will then call
+// onDone on the main goroutine AFTER the RELEASE event has been processed by
+// GLFW, avoiding the nil-viewport crash in processMouseClicked.
 func (w *regionOverlayWidget) handleMarkupMouseDown(pos fyne.Position) {
 	sz := w.Size()
+
+	// hitMarkupBar acquires w.mu internally, so call it before locking here.
 	hit := w.hitMarkupBar(pos, sz)
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	if w.done {
+		return
+	}
+
+	// Confirmation dialog takes priority (hitMarkupBar already routes inside it).
+	if w.showExitConfirm {
+		switch hit {
+		case mkHitConfirmYes:
+			w.done = true
+			w.pendingExit = true // MouseUp will invoke onDone on the main goroutine
+		case mkHitConfirmNo:
+			startT := w.confirmAnimT
+			if w.confirmAnim != nil {
+				w.confirmAnim.Stop()
+			}
+			anim := fyne.NewAnimation(160*time.Millisecond, func(t float32) {
+				w.confirmAnimT = startT * (1 - t)
+				if t >= 1.0 {
+					w.mu.Lock()
+					w.showExitConfirm = false
+					w.mu.Unlock()
+				}
+				w.Refresh()
+			})
+			anim.Curve = fyne.AnimationEaseIn
+			w.confirmAnim = anim
+			anim.Start()
+		}
+		return
+	}
+
+	// Exit Markup button (top-left).
+	if hit == mkHitExit {
+		if len(w.mkUndoBufs) > 0 {
+			w.showExitConfirm = true
+			w.confirmAnimT = 0
+			if w.confirmAnim != nil {
+				w.confirmAnim.Stop()
+			}
+			anim := fyne.NewAnimation(220*time.Millisecond, func(t float32) {
+				w.confirmAnimT = t
+				w.Refresh()
+			})
+			anim.Curve = fyne.AnimationEaseOut
+			w.confirmAnim = anim
+			anim.Start()
+		} else {
+			w.done = true
+			w.pendingExit = true // MouseUp will invoke onDone on the main goroutine
+		}
 		return
 	}
 
@@ -573,6 +675,7 @@ func (r *regionOverlayRenderer) paintMarkupMode(sz fyne.Size) {
 	pts := append([]image.Point(nil), w.mkPoints...)
 	hoverCode := w.mkHoverCode
 	hasUndo := len(w.mkUndoBufs) > 0
+	showExitConfirm := w.showExitConfirm
 
 	// Ensure markup buffer exists
 	bw := intMax(int(sz.Width), 1)
@@ -605,6 +708,8 @@ func (r *regionOverlayRenderer) paintMarkupMode(sz fyne.Size) {
 	if !drawing {
 		r.mkLastPtN = 0
 	}
+
+	animT := w.confirmAnimT // not mutex-protected, consistent with indicX/modeAnim pattern
 
 	w.mu.Unlock()
 
@@ -695,6 +800,7 @@ func (r *regionOverlayRenderer) paintMarkupMode(sz fyne.Size) {
 			r.mkToolLbl[i].Color = color.NRGBA{0xbb, 0xbb, 0xbb, 0xff}
 			r.mkToolLbl[i].TextStyle = fyne.TextStyle{}
 		}
+		r.mkToolLbl[i].Show()
 		r.mkToolLbl[i].Move(fyne.NewPos(bx, btnTopY+mkBtnH/2-6))
 		r.mkToolLbl[i].Resize(fyne.NewSize(mkBtnW, 18))
 	}
@@ -704,27 +810,48 @@ func (r *regionOverlayRenderer) paintMarkupMode(sz fyne.Size) {
 	midY := barTopY + mkBarH/2
 
 	// Color swatch + label
+	r.mkColorLbl.Show()
 	r.mkColorLbl.Move(fyne.NewPos(w.mkOptionsX(), midY-18))
 	r.mkColorLbl.Resize(fyne.NewSize(32, 14))
 	r.mkColorSwatch.FillColor = col
+	if hoverCode == mkHitColor {
+		r.mkColorSwatch.StrokeColor = color.NRGBA{0x88, 0xaa, 0xff, 0xff}
+		r.mkColorSwatch.StrokeWidth = 2
+	} else {
+		r.mkColorSwatch.StrokeColor = color.NRGBA{0x66, 0x66, 0x66, 0xff}
+		r.mkColorSwatch.StrokeWidth = 1
+	}
 	r.mkColorSwatch.Move(fyne.NewPos(colorX, midY-mkSwatchSz/2))
 	r.mkColorSwatch.Resize(fyne.NewSize(mkSwatchSz, mkSwatchSz))
 
 	// Separator label for size
+	r.mkSizeLbl.Show()
 	r.mkSizeLbl.Text = fmt.Sprintf("%d", size)
 	r.mkSizeLbl.Move(fyne.NewPos(sizeValX, midY-10))
 	r.mkSizeLbl.Resize(fyne.NewSize(26, 18))
 	canvas.Refresh(r.mkSizeLbl)
 
 	// [-]
+	if hoverCode == mkHitSizeMinus {
+		r.mkSizeMinBg.FillColor = color.NRGBA{0x3d, 0x3d, 0x3d, 0xff}
+	} else {
+		r.mkSizeMinBg.FillColor = color.NRGBA{0x2a, 0x2a, 0x2a, 0xff}
+	}
 	r.mkSizeMinBg.Move(fyne.NewPos(sizeMinX, midY-13))
 	r.mkSizeMinBg.Resize(fyne.NewSize(mkStepperW, 26))
+	r.mkSizeMinLbl.Show()
 	r.mkSizeMinLbl.Move(fyne.NewPos(sizeMinX, midY-10))
 	r.mkSizeMinLbl.Resize(fyne.NewSize(mkStepperW, 18))
 
 	// [+]
+	if hoverCode == mkHitSizePlus {
+		r.mkSizePlusBg.FillColor = color.NRGBA{0x3d, 0x3d, 0x3d, 0xff}
+	} else {
+		r.mkSizePlusBg.FillColor = color.NRGBA{0x2a, 0x2a, 0x2a, 0xff}
+	}
 	r.mkSizePlusBg.Move(fyne.NewPos(sizePlusX, midY-13))
 	r.mkSizePlusBg.Resize(fyne.NewSize(mkStepperW, 26))
+	r.mkSizePlusLbl.Show()
 	r.mkSizePlusLbl.Move(fyne.NewPos(sizePlusX, midY-10))
 	r.mkSizePlusLbl.Resize(fyne.NewSize(mkStepperW, 18))
 
@@ -732,9 +859,13 @@ func (r *regionOverlayRenderer) paintMarkupMode(sz fyne.Size) {
 	fillTogW := float32(52)
 	switch tool {
 	case mkToolRect, mkToolCircle:
+		fillHover := hoverCode == mkHitFillTog
 		if fill {
 			r.mkFillTogBg.FillColor = color.NRGBA{0x26, 0x60, 0xd0, 0xff}
 			r.mkFillTogLbl.Color = color.NRGBA{0xff, 0xff, 0xff, 0xff}
+		} else if fillHover {
+			r.mkFillTogBg.FillColor = color.NRGBA{0x3a, 0x3a, 0x3a, 0xff}
+			r.mkFillTogLbl.Color = color.NRGBA{0xdd, 0xdd, 0xdd, 0xff}
 		} else {
 			r.mkFillTogBg.FillColor = color.NRGBA{0x2a, 0x2a, 0x2a, 0xff}
 			r.mkFillTogLbl.Color = color.NRGBA{0xbb, 0xbb, 0xbb, 0xff}
@@ -759,27 +890,32 @@ func (r *regionOverlayRenderer) paintMarkupMode(sz fyne.Size) {
 			b.Resize(zero)
 		}
 		for _, l := range r.mkBlurLbl {
-			l.Resize(zero)
+			l.Hide()
 		}
 
 	case mkToolBlur:
 		r.mkFillTogBg.Resize(zero)
-		r.mkFillTogLbl.Resize(zero)
+		r.mkFillTogLbl.Hide()
 		r.mkFillSwatch.Resize(zero)
 
 		bw2 := float32(66)
 		blurNames := [2]string{"Mosaic", "Smooth"}
 		for i := 0; i < 2; i++ {
 			bx2 := toolOptX + float32(i)*(bw2+6)
+			isBlurHover := hoverCode == mkHitBlur0+i
 			if blurType == i {
 				r.mkBlurBg[i].FillColor = color.NRGBA{0x26, 0x60, 0xd0, 0xff}
 				r.mkBlurLbl[i].Color = color.NRGBA{0xff, 0xff, 0xff, 0xff}
+			} else if isBlurHover {
+				r.mkBlurBg[i].FillColor = color.NRGBA{0x3a, 0x3a, 0x3a, 0xff}
+				r.mkBlurLbl[i].Color = color.NRGBA{0xdd, 0xdd, 0xdd, 0xff}
 			} else {
 				r.mkBlurBg[i].FillColor = color.NRGBA{0x2a, 0x2a, 0x2a, 0xff}
 				r.mkBlurLbl[i].Color = color.NRGBA{0xbb, 0xbb, 0xbb, 0xff}
 			}
 			r.mkBlurBg[i].Move(fyne.NewPos(bx2, midY-14))
 			r.mkBlurBg[i].Resize(fyne.NewSize(bw2, 28))
+			r.mkBlurLbl[i].Show()
 			r.mkBlurLbl[i].Text = blurNames[i]
 			r.mkBlurLbl[i].Move(fyne.NewPos(bx2, midY-8))
 			r.mkBlurLbl[i].Resize(fyne.NewSize(bw2, 16))
@@ -787,13 +923,13 @@ func (r *regionOverlayRenderer) paintMarkupMode(sz fyne.Size) {
 
 	default:
 		r.mkFillTogBg.Resize(zero)
-		r.mkFillTogLbl.Resize(zero)
+		r.mkFillTogLbl.Hide()
 		r.mkFillSwatch.Resize(zero)
 		for _, b := range r.mkBlurBg {
 			b.Resize(zero)
 		}
 		for _, l := range r.mkBlurLbl {
-			l.Resize(zero)
+			l.Hide()
 		}
 	}
 
@@ -802,17 +938,32 @@ func (r *regionOverlayRenderer) paintMarkupMode(sz fyne.Size) {
 	if !hasUndo {
 		undoAlpha = 0x44
 	}
+	undoHover := hoverCode == mkHitUndo && hasUndo
+	if undoHover {
+		r.mkUndoBg.FillColor = color.NRGBA{0x3d, 0x3d, 0x3d, 0xff}
+		r.mkUndoBg.StrokeColor = color.NRGBA{0x5a, 0x5a, 0x5a, 0xff}
+	} else {
+		r.mkUndoBg.FillColor = color.NRGBA{0x2a, 0x2a, 0x2a, 0xff}
+		r.mkUndoBg.StrokeColor = color.NRGBA{0x44, 0x44, 0x44, 0xff}
+	}
 	undoBtnH := float32(42)
 	r.mkUndoBg.Move(fyne.NewPos(undoX, midY-undoBtnH/2))
 	r.mkUndoBg.Resize(fyne.NewSize(mkUndoW, undoBtnH))
+	r.mkUndoLbl.Show()
 	r.mkUndoLbl.Color = color.NRGBA{undoAlpha, undoAlpha, undoAlpha, undoAlpha}
 	r.mkUndoLbl.Move(fyne.NewPos(undoX, midY-8))
 	r.mkUndoLbl.Resize(fyne.NewSize(mkUndoW, 16))
 
 	// Capture button
 	capBtnH := float32(48)
+	if hoverCode == mkHitCapture {
+		r.mkCaptureBg.FillColor = color.NRGBA{0x1e, 0x85, 0xff, 0xff}
+	} else {
+		r.mkCaptureBg.FillColor = color.NRGBA{0x16, 0x70, 0xe8, 0xff}
+	}
 	r.mkCaptureBg.Move(fyne.NewPos(captureX, midY-capBtnH/2))
 	r.mkCaptureBg.Resize(fyne.NewSize(mkCaptureW, capBtnH))
+	r.mkCaptureLbl.Show()
 	r.mkCaptureLbl.Move(fyne.NewPos(captureX, midY-9))
 	r.mkCaptureLbl.Resize(fyne.NewSize(mkCaptureW, 18))
 
@@ -841,6 +992,15 @@ func (r *regionOverlayRenderer) paintMarkupMode(sz fyne.Size) {
 			row := i / 4
 			px := palX + float32(col2)*30
 			py := palY + float32(row)*30
+			isPalHover := (!palForFill && hoverCode == mkHitPalBase+i) ||
+				(palForFill && hoverCode == mkHitPalFillBase+i)
+			if isPalHover {
+				r.mkPalSwatch[i].StrokeColor = color.NRGBA{0xff, 0xff, 0xff, 0xe0}
+				r.mkPalSwatch[i].StrokeWidth = 2
+			} else {
+				r.mkPalSwatch[i].StrokeColor = color.NRGBA{0x55, 0x55, 0x55, 0xff}
+				r.mkPalSwatch[i].StrokeWidth = 1
+			}
 			r.mkPalSwatch[i].Move(fyne.NewPos(px, py))
 			r.mkPalSwatch[i].Resize(fyne.NewSize(26, 26))
 			r.mkPalSwatch[i].Show()
@@ -850,6 +1010,93 @@ func (r *regionOverlayRenderer) paintMarkupMode(sz fyne.Size) {
 		for _, sw := range r.mkPalSwatch {
 			sw.Resize(zero)
 		}
+	}
+
+	// ── Exit Markup button (top-left pill) ───────────────────────────────────────
+	ey := mkExitBtnY()
+	exitHover := hoverCode == mkHitExit
+	if exitHover {
+		r.mkExitBg.FillColor = color.NRGBA{0x38, 0x38, 0x38, 0xf8}
+		r.mkExitBg.StrokeColor = color.NRGBA{0x60, 0x88, 0xd0, 0xff}
+		r.mkExitLbl.Color = color.NRGBA{0xff, 0xff, 0xff, 0xff}
+	} else {
+		r.mkExitBg.FillColor = color.NRGBA{0x26, 0x26, 0x26, 0xf0}
+		r.mkExitBg.StrokeColor = color.NRGBA{0x50, 0x50, 0x50, 0xff}
+		r.mkExitLbl.Color = color.NRGBA{0xcc, 0xcc, 0xcc, 0xff}
+	}
+	r.mkExitBg.Move(fyne.NewPos(mkExitBtnX, ey))
+	r.mkExitBg.Resize(fyne.NewSize(mkExitBtnW, mkExitBtnH))
+	r.mkExitLbl.Show()
+	r.mkExitLbl.Move(fyne.NewPos(mkExitBtnX, ey+mkExitBtnH/2-8))
+	r.mkExitLbl.Resize(fyne.NewSize(mkExitBtnW, 16))
+
+	// ── Confirmation dialog ───────────────────────────────────────────────────────
+	if showExitConfirm && animT > 0 {
+		cx2 := sz.Width / 2
+		cy2 := sz.Height / 2
+
+		// Full-screen dim overlay: alpha fades in with animT
+		r.mkConfirmBg.FillColor = color.NRGBA{0, 0, 0, uint8(float32(0xb8) * animT)}
+		r.mkConfirmBg.Move(fyne.NewPos(0, 0))
+		r.mkConfirmBg.Resize(sz)
+
+		// Card: slides in from 20px above its final position
+		slideOff := float32(20) * (1 - animT)
+		cardX := cx2 - confirmCardW/2
+		cardY := cy2 + confirmCardOffY - slideOff
+		r.mkConfirmCard.Move(fyne.NewPos(cardX, cardY))
+		r.mkConfirmCard.Resize(fyne.NewSize(confirmCardW, confirmCardH))
+
+		// Title
+		r.mkConfirmTitle.Show()
+		r.mkConfirmTitle.Move(fyne.NewPos(cardX+24, cardY+22))
+		r.mkConfirmTitle.Resize(fyne.NewSize(confirmCardW-48, 22))
+		canvas.Refresh(r.mkConfirmTitle)
+
+		// Body
+		r.mkConfirmMsg.Show()
+		r.mkConfirmMsg.Text = "Your markup annotations will not be saved."
+		r.mkConfirmMsg.Move(fyne.NewPos(cardX+24, cardY+54))
+		r.mkConfirmMsg.Resize(fyne.NewSize(confirmCardW-48, 18))
+		canvas.Refresh(r.mkConfirmMsg)
+
+		// "Keep Editing" button (No / left)
+		noHover := hoverCode == mkHitConfirmNo
+		if noHover {
+			r.mkConfirmNoBg.FillColor = color.NRGBA{0x4a, 0x4a, 0x4a, 0xff}
+		} else {
+			r.mkConfirmNoBg.FillColor = color.NRGBA{0x38, 0x38, 0x38, 0xff}
+		}
+		noBtnX := cx2 + confirmNoBtnOX
+		btnY := cy2 + confirmBtnOffY - slideOff
+		r.mkConfirmNoBg.Move(fyne.NewPos(noBtnX, btnY))
+		r.mkConfirmNoBg.Resize(fyne.NewSize(confirmBtnW, confirmBtnH))
+		r.mkConfirmNoLbl.Show()
+		r.mkConfirmNoLbl.Move(fyne.NewPos(noBtnX, btnY+confirmBtnH/2-8))
+		r.mkConfirmNoLbl.Resize(fyne.NewSize(confirmBtnW, 16))
+
+		// "Discard & Exit" button (Yes / right)
+		yesHover := hoverCode == mkHitConfirmYes
+		if yesHover {
+			r.mkConfirmYesBg.FillColor = color.NRGBA{0xcc, 0x22, 0x22, 0xff}
+		} else {
+			r.mkConfirmYesBg.FillColor = color.NRGBA{0xaa, 0x18, 0x18, 0xff}
+		}
+		yesBtnX := cx2 + confirmYesBtnOX
+		r.mkConfirmYesBg.Move(fyne.NewPos(yesBtnX, btnY))
+		r.mkConfirmYesBg.Resize(fyne.NewSize(confirmBtnW, confirmBtnH))
+		r.mkConfirmYesLbl.Show()
+		r.mkConfirmYesLbl.Move(fyne.NewPos(yesBtnX, btnY+confirmBtnH/2-8))
+		r.mkConfirmYesLbl.Resize(fyne.NewSize(confirmBtnW, 16))
+	} else {
+		r.mkConfirmBg.Resize(zero)
+		r.mkConfirmCard.Resize(zero)
+		r.mkConfirmTitle.Hide()
+		r.mkConfirmMsg.Hide()
+		r.mkConfirmYesBg.Resize(zero)
+		r.mkConfirmYesLbl.Hide()
+		r.mkConfirmNoBg.Resize(zero)
+		r.mkConfirmNoLbl.Hide()
 	}
 }
 

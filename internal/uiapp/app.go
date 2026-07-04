@@ -42,11 +42,10 @@ const (
 type RecordingUI struct {
 	app        fyne.App
 	mainWin    fyne.Window
-	startBtn   *widget.Button
-	stopBtn    *widget.Button
+	startBtn   *hoverButton
+	stopBtn    *hoverButton
 	statusText *widget.Label
 	statusDot  *canvas.Circle
-	regionLabel *widget.Label
 	configSummary *widget.Label
 	audioToggle   *widget.Check
 	cursorToggle  *widget.Check
@@ -55,20 +54,23 @@ type RecordingUI struct {
 	captureMode   int  // 0 = recording, 1 = screenshot
 	recordPanel   *fyne.Container
 	shotPanel     *fyne.Container
-	shotActionBtn *widget.Button
-	pauseBtn      *widget.Button
+	shotActionBtn *hoverButton
+	pauseBtn      *hoverButton
 	elapsedLabel  *widget.Label
 
 	sidebarBgObj    *canvas.Rectangle
 	sidebarScroll   fyne.CanvasObject
-	collapseBtn     *widget.Button
+	collapseBtn     *sidebarToggleIcon
 	sidebarExpanded bool
-	widthEnforcer   fyne.CanvasObject
-	actionBtn       *widget.Button
+	split           *splitView
+	actionBtn       *hoverButton
+	settingsCard    fyne.CanvasObject
+	statusCard      fyne.CanvasObject
+	sidebarAnim     *fyne.Animation
 
 	desktopApp    desktop.App
 	toast         *toastHandle
-	countdown     *countdownOverlay
+	countdown     *countdownBanner
 	settingsWin   *settingsWindow
 	recordingsList *recordingsList
 	config        *RecordingConfig
@@ -124,13 +126,55 @@ func newRecordingUI(a fyne.App) *RecordingUI {
 	if desk, ok := a.(desktop.App); ok {
 		ui.desktopApp = desk
 	}
+	ui.loadPrefs()
 	return ui
+}
+
+// loadPrefs restores all remembered settings from app preferences, falling back
+// to the config defaults for anything not yet saved.
+func (ui *RecordingUI) loadPrefs() {
+	p := ui.app.Preferences()
+	c := ui.config
+	c.SetFPS(p.IntWithFallback("fps", c.GetFPS()))
+	c.SetBitrate(p.IntWithFallback("bitrate", c.GetBitrate()))
+	c.SetAudio(p.BoolWithFallback("audio", c.GetAudio()))
+	c.SetCursor(p.BoolWithFallback("cursor", c.GetCursor()))
+	c.SetContainer(p.StringWithFallback("container", c.GetContainer()))
+	c.SetMaxDur(p.IntWithFallback("max_dur", c.GetMaxDur()))
+	c.SetThreads(p.IntWithFallback("threads", c.GetThreads()))
+	c.SetQP(p.IntWithFallback("qp", c.GetQP()))
+	c.SetNice(p.IntWithFallback("nice", c.GetNice()))
+	c.SetShotFormat(p.StringWithFallback("shot_format", c.GetShotFormat()))
+	c.SetShotCursor(p.BoolWithFallback("shot_cursor", c.GetShotCursor()))
+	if d := p.IntWithFallback("record_delay", -1); d >= 0 && d <= 10 {
+		c.SetRecordDelay(d)
+	}
+	if d := p.IntWithFallback("shot_delay", -1); d >= 0 && d <= 60 {
+		c.SetShotDelay(d)
+	}
+}
+
+// persistConfig writes all remembered settings to app preferences.
+func (ui *RecordingUI) persistConfig() {
+	p := ui.app.Preferences()
+	c := ui.config
+	p.SetInt("fps", c.GetFPS())
+	p.SetInt("bitrate", c.GetBitrate())
+	p.SetBool("audio", c.GetAudio())
+	p.SetBool("cursor", c.GetCursor())
+	p.SetString("container", c.GetContainer())
+	p.SetInt("max_dur", c.GetMaxDur())
+	p.SetInt("threads", c.GetThreads())
+	p.SetInt("qp", c.GetQP())
+	p.SetInt("nice", c.GetNice())
+	p.SetString("shot_format", c.GetShotFormat())
+	p.SetBool("shot_cursor", c.GetShotCursor())
 }
 
 func (ui *RecordingUI) buildMainWindow() {
 	win := ui.app.NewWindow("SwiftCap")
 	win.SetIcon(baseAppIcon())
-	win.Resize(fyne.NewSize(800, 640))
+	win.Resize(fyne.NewSize(1120, 760))
 	win.SetFixedSize(false)
 	win.CenterOnScreen()
 
@@ -154,13 +198,13 @@ func (ui *RecordingUI) buildMainWindow() {
 	ui.elapsedLabel = widget.NewLabel("00:00")
 	ui.elapsedLabel.TextStyle = fyne.TextStyle{Monospace: true}
 
-	ui.stopBtn = widget.NewButtonWithIcon("Stop", theme.MediaStopIcon(), func() {
+	ui.stopBtn = newButtonWithIcon("Stop", theme.MediaStopIcon(), func() {
 		go ui.handleStop()
 	})
 	ui.stopBtn.Importance = widget.DangerImportance
 	ui.stopBtn.Disable()
 
-	ui.pauseBtn = widget.NewButtonWithIcon("Pause", theme.MediaPauseIcon(), func() {
+	ui.pauseBtn = newButtonWithIcon("Pause", theme.MediaPauseIcon(), func() {
 		ui.mu.Lock()
 		paused := ui.isPaused
 		ui.mu.Unlock()
@@ -174,30 +218,29 @@ func (ui *RecordingUI) buildMainWindow() {
 	ui.pauseBtn.Disable()
 
 	// Recording settings panel
-	ui.audioToggle = widget.NewCheck("Audio", func(b bool) { ui.config.SetAudio(b) })
-	ui.cursorToggle = widget.NewCheck("Show cursor", func(b bool) { ui.config.SetCursor(b) })
+	ui.audioToggle = widget.NewCheck("Audio", func(b bool) { ui.config.SetAudio(b); ui.persistConfig() })
+	ui.cursorToggle = widget.NewCheck("Show cursor", func(b bool) { ui.config.SetCursor(b); ui.persistConfig() })
 
-	recDelayStepper := newNumericStepper(ui.config.GetRecordDelay(), 0, 60, func(n int) {
+	if ui.config.GetRecordDelay() > 10 {
+		ui.config.SetRecordDelay(10)
+	}
+	recDelayStepper := newNumericStepper(ui.config.GetRecordDelay(), 0, 10, func(n int) {
 		ui.config.SetRecordDelay(n)
+		ui.app.Preferences().SetInt("record_delay", n)
 	})
 
 	ui.containerSelect = widget.NewSelect([]string{"mp4", "mkv", "mov", "avi"}, func(s string) {
 		ui.config.SetContainer(s)
+		ui.persistConfig()
 		ui.refreshConfigSummary()
 	})
 	ui.containerSelect.SetSelected(ui.config.GetContainer())
 
-	ui.regionLabel = widget.NewLabel("Full Screen")
-	ui.regionLabel.TextStyle = fyne.TextStyle{Monospace: true}
-
-	selectAreaBtn := widget.NewButtonWithIcon("Select Area", theme.ViewRestoreIcon(), func() { ui.selectRegion() })
-	selectAreaBtn.Importance = widget.LowImportance
-	fullScreenBtn := widget.NewButtonWithIcon("Full Screen", theme.ViewFullScreenIcon(), func() { ui.clearRegion() })
-	fullScreenBtn.Importance = widget.LowImportance
-
 	ui.configSummary = widget.NewLabel("")
 	ui.configSummary.Wrapping = fyne.TextWrapWord
 
+	// No region controls here: the area (region or full screen) is chosen at the
+	// moment you press Start Recording / Take Screenshot, via the snip overlay.
 	ui.recordPanel = container.NewVBox(
 		widget.NewLabelWithStyle("Recording", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		widget.NewSeparator(),
@@ -205,20 +248,18 @@ func (ui *RecordingUI) buildMainWindow() {
 		ui.audioToggle,
 		container.NewBorder(nil, nil, widget.NewLabel("Delay"), nil, recDelayStepper),
 		container.NewBorder(nil, nil, widget.NewLabel("Format"), nil, ui.containerSelect),
-		widget.NewLabel("Region"),
-		container.NewVBox(selectAreaBtn, fullScreenBtn),
-		ui.regionLabel,
 	)
 
 	// Screenshot settings panel
-	shotCursorCheck := widget.NewCheck("Show cursor", func(b bool) { ui.config.SetShotCursor(b) })
+	shotCursorCheck := widget.NewCheck("Show cursor", func(b bool) { ui.config.SetShotCursor(b); ui.persistConfig() })
 	shotCursorCheck.SetChecked(ui.config.GetShotCursor())
 
 	shotDelayStepper := newNumericStepper(ui.config.GetShotDelay(), 0, 60, func(n int) {
 		ui.config.SetShotDelay(n)
+		ui.app.Preferences().SetInt("shot_delay", n)
 	})
 
-	shotFmtSelect := widget.NewSelect([]string{"png", "jpg", "webp", "bmp"}, func(s string) { ui.config.SetShotFormat(s) })
+	shotFmtSelect := widget.NewSelect([]string{"png", "jpg", "webp", "bmp"}, func(s string) { ui.config.SetShotFormat(s); ui.persistConfig() })
 	shotFmtSelect.SetSelected(ui.config.GetShotFormat())
 
 	ui.shotPanel = container.NewVBox(
@@ -230,16 +271,26 @@ func (ui *RecordingUI) buildMainWindow() {
 	)
 	ui.shotPanel.Hide()
 
-	// widthEnforcer lives in the OUTER VBox so Border layout sees the min width.
-	// VScroll does not propagate content min-width, so putting it inside the scroll
-	// had no effect on the sidebar column width.
-	sidebarInner := container.NewVBox(
-		statusRow,
-		ui.elapsedLabel,
-		container.NewGridWithColumns(2, ui.stopBtn, ui.pauseBtn),
+	// ── Status + controls card ───────────────────────────────────────────────
+	// Elapsed time sits on the right of the status row so both are readable at a glance.
+	statusBar := container.NewBorder(nil, nil, statusRow, ui.elapsedLabel)
+	statusCardBody := container.NewVBox(
+		statusBar,
 		widget.NewSeparator(),
-		ui.recordPanel,
-		ui.shotPanel,
+		container.NewGridWithColumns(2, ui.stopBtn, ui.pauseBtn),
+	)
+
+	// ── Settings card (record / screenshot panels swap on mode toggle) ───────
+	settingsCardBody := container.NewVBox(ui.recordPanel, ui.shotPanel)
+	ui.settingsCard = sidebarCard(settingsCardBody)
+	ui.statusCard = sidebarCard(statusCardBody)
+
+	// Top spacer reserves room for the toggle icon (top-right, ~12+28px tall)
+	// so it has its own row and the cards start clear below it.
+	sidebarInner := container.NewVBox(
+		newHeightSpacer(40),
+		ui.statusCard,
+		ui.settingsCard,
 	)
 
 	sidebarScrollObj := container.NewVScroll(container.NewPadded(sidebarInner))
@@ -247,20 +298,11 @@ func (ui *RecordingUI) buildMainWindow() {
 
 	ui.sidebarBgObj = canvas.NewRectangle(sidebarBgColor)
 	ui.sidebarExpanded = true
-	ui.widthEnforcer = newWidthSpacer(230)
 
-	ui.collapseBtn = widget.NewButtonWithIcon("", theme.NavigateBackIcon(), func() {
+	// Sidebar toggle icon — positioned by splitView (top-left when open, top-right when collapsed).
+	ui.collapseBtn = newSidebarToggleIcon(func() {
 		ui.toggleSidebar()
 	})
-	ui.collapseBtn.Importance = widget.LowImportance
-
-	// NewVBox doesn't stretch its children — the scroll would only get its min
-	// height and leave a dead gap. NewBorder gives the scroll all remaining space.
-	sidebarTop := container.NewVBox(ui.collapseBtn, ui.widthEnforcer)
-	sidebar := container.NewStack(
-		ui.sidebarBgObj,
-		container.NewBorder(sidebarTop, nil, nil, nil, sidebarScrollObj),
-	)
 
 	// ── Main area ────────────────────────────────────────────────────────────
 
@@ -268,7 +310,7 @@ func (ui *RecordingUI) buildMainWindow() {
 	appTitle.TextSize = 22
 	appTitle.TextStyle = fyne.TextStyle{Bold: true}
 
-	openFolderBtn := widget.NewButtonWithIcon("", theme.FolderOpenIcon(), func() {
+	openFolderBtn := newButtonWithIcon("", theme.FolderOpenIcon(), func() {
 		dir, err := ui.ensureVideosDir()
 		if err != nil {
 			ui.showError("Videos", err.Error())
@@ -279,7 +321,7 @@ func (ui *RecordingUI) buildMainWindow() {
 		}
 	})
 	openFolderBtn.Importance = widget.LowImportance
-	settingsBtn := widget.NewButtonWithIcon("", theme.SettingsIcon(), func() { ui.showSettings() })
+	settingsBtn := newButtonWithIcon("", theme.SettingsIcon(), func() { ui.showSettings() })
 	settingsBtn.Importance = widget.LowImportance
 
 	mainHeader := container.NewBorder(nil, nil,
@@ -293,9 +335,10 @@ func (ui *RecordingUI) buildMainWindow() {
 	}, func(idx int) {
 		ui.setMode(idx)
 	})
+	seg.Selected = 1 // default to Capture; ui.setMode(1) below syncs the panels
 
 	// Single action button — text/icon swaps instantly when mode changes.
-	ui.actionBtn = widget.NewButtonWithIcon("  Start Recording", theme.MediaRecordIcon(), func() {
+	ui.actionBtn = newButtonWithIcon("  Start Recording", theme.MediaRecordIcon(), func() {
 		if ui.captureMode == 0 {
 			go ui.handleStart()
 		} else {
@@ -305,10 +348,9 @@ func (ui *RecordingUI) buildMainWindow() {
 	ui.actionBtn.Importance = widget.HighImportance
 
 	videosDir, _ := ui.ensureVideosDir()
-	ui.recordingsList = newRecordingsList(videosDir, func(path string) {
-		if err := openFileFromToast(path); err != nil {
-			ui.showError("Open File", err.Error())
-		}
+	screenshotsDir, _ := ui.ensureScreenshotsDir()
+	ui.recordingsList = newRecordingsList(videosDir, screenshotsDir, func(path string) {
+		ui.showCaptureViewer(path)
 	})
 
 	// Use Border layout so the recordings list stretches to fill remaining height.
@@ -324,13 +366,24 @@ func (ui *RecordingUI) buildMainWindow() {
 	)
 	mainContent := container.NewBorder(mainTop, nil, nil, nil, ui.recordingsList.getContainer())
 
-	root := container.NewBorder(nil, nil, sidebar, nil, container.NewPadded(mainContent))
+	sidebarSep := newVertSep(color.NRGBA{0x38, 0x38, 0x38, 0xff})
+	const mainPad = float32(14)
+	mainPadded := container.NewBorder(
+		newHeightSpacer(mainPad), newHeightSpacer(mainPad),
+		newWidthSpacer(mainPad), newWidthSpacer(mainPad),
+		mainContent,
+	)
+
+	// Custom split: drives sidebar width directly so collapse/expand can animate
+	// without re-rendering the whole window (only Move/Resize, never re-rasterize).
+	ui.split = newSplitView(ui.sidebarBgObj, sidebarScrollObj, ui.collapseBtn, sidebarSep, mainPadded, sidebarExpandedW)
+	root := ui.split
 	win.SetContent(root)
 	ui.mainWin = win
 	ui.windowVisible = true
 	ui.syncQuickControls()
-	ui.updateRegionLabel()
 	ui.refreshConfigSummary()
+	ui.setMode(1) // default the home screen to Capture (screenshot)
 	win.Show()
 }
 
@@ -339,6 +392,9 @@ func (ui *RecordingUI) setMode(mode int) {
 	if mode == 0 {
 		ui.recordPanel.Show()
 		ui.shotPanel.Hide()
+		if ui.statusCard != nil {
+			ui.statusCard.Show()
+		}
 		if ui.actionBtn != nil {
 			ui.actionBtn.SetIcon(theme.MediaRecordIcon())
 			ui.actionBtn.SetText("  Start Recording")
@@ -346,6 +402,9 @@ func (ui *RecordingUI) setMode(mode int) {
 	} else {
 		ui.recordPanel.Hide()
 		ui.shotPanel.Show()
+		if ui.statusCard != nil {
+			ui.statusCard.Hide()
+		}
 		if ui.actionBtn != nil {
 			ui.actionBtn.SetIcon(theme.FileImageIcon())
 			ui.actionBtn.SetText("  Take Screenshot")
@@ -354,25 +413,35 @@ func (ui *RecordingUI) setMode(mode int) {
 }
 
 func (ui *RecordingUI) toggleSidebar() {
-	ui.sidebarExpanded = !ui.sidebarExpanded
-	if ui.sidebarExpanded {
-		ui.sidebarBgObj.Show()
+	if ui.sidebarAnim != nil {
+		ui.sidebarAnim.Stop()
+		ui.sidebarAnim = nil
+	}
+
+	expanding := !ui.sidebarExpanded
+	ui.sidebarExpanded = expanding
+
+	startW := ui.split.sidebarW
+	var endW float32
+	if expanding {
+		endW = sidebarExpandedW
+		// Show content up front so it's visible as the panel widens; it sits at a
+		// fixed width so widening never re-lays-out the sidebar widgets.
 		ui.sidebarScroll.Show()
-		if ui.widthEnforcer != nil {
-			ui.widthEnforcer.Show()
-		}
-		ui.collapseBtn.SetIcon(theme.NavigateBackIcon())
 	} else {
-		ui.sidebarBgObj.Hide()
-		ui.sidebarScroll.Hide()
-		if ui.widthEnforcer != nil {
-			ui.widthEnforcer.Hide()
+		endW = sidebarCollapsedW
+	}
+
+	anim := fyne.NewAnimation(130*time.Millisecond, func(t float32) {
+		ui.split.setSidebarW(startW + (endW-startW)*t)
+		if t >= 1 && !expanding {
+			// Hide content only once fully collapsed, so it doesn't pop during the slide.
+			ui.sidebarScroll.Hide()
 		}
-		ui.collapseBtn.SetIcon(theme.NavigateNextIcon())
-	}
-	if ui.mainWin != nil {
-		ui.mainWin.Content().Refresh()
-	}
+	})
+	anim.Curve = fyne.AnimationEaseOut
+	anim.Start()
+	ui.sidebarAnim = anim
 }
 
 // widthSpacer is a transparent widget that enforces a minimum width in a VBox,
@@ -389,9 +458,209 @@ func newWidthSpacer(w float32) *widthSpacer {
 }
 
 func (s *widthSpacer) MinSize() fyne.Size { return fyne.NewSize(s.w, 1) }
+func (s *widthSpacer) SetW(w float32) { s.w = w; s.Refresh() }
 func (s *widthSpacer) CreateRenderer() fyne.WidgetRenderer {
 	return widget.NewSimpleRenderer(canvas.NewRectangle(color.Transparent))
 }
+
+type heightSpacer struct {
+	widget.BaseWidget
+	h float32
+}
+
+func newHeightSpacer(h float32) *heightSpacer {
+	s := &heightSpacer{h: h}
+	s.ExtendBaseWidget(s)
+	return s
+}
+
+func (s *heightSpacer) MinSize() fyne.Size { return fyne.NewSize(1, s.h) }
+func (s *heightSpacer) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(canvas.NewRectangle(color.Transparent))
+}
+
+// sidebarToggleIcon draws a two-pane "toggle sidebar" glyph (outlined box split
+// by a vertical divider into a narrow and a wide pane) instead of a text chevron.
+type sidebarToggleIcon struct {
+	widget.BaseWidget
+	onTap   func()
+	hovered bool
+}
+
+func newSidebarToggleIcon(onTap func()) *sidebarToggleIcon {
+	i := &sidebarToggleIcon{onTap: onTap}
+	i.ExtendBaseWidget(i)
+	return i
+}
+
+func (i *sidebarToggleIcon) MinSize() fyne.Size { return fyne.NewSize(28, 28) }
+
+func (i *sidebarToggleIcon) Tapped(*fyne.PointEvent) {
+	if i.onTap != nil {
+		i.onTap()
+	}
+}
+func (i *sidebarToggleIcon) TappedSecondary(*fyne.PointEvent) {}
+
+func (i *sidebarToggleIcon) MouseIn(*desktop.MouseEvent) {
+	i.hovered = true
+	i.Refresh()
+}
+func (i *sidebarToggleIcon) MouseMoved(*desktop.MouseEvent) {}
+func (i *sidebarToggleIcon) MouseOut() {
+	i.hovered = false
+	i.Refresh()
+}
+
+func (i *sidebarToggleIcon) Cursor() desktop.Cursor { return desktop.PointerCursor }
+
+func (i *sidebarToggleIcon) CreateRenderer() fyne.WidgetRenderer {
+	outline := canvas.NewRectangle(color.Transparent)
+	outline.StrokeColor = color.NRGBA{0xaa, 0xaa, 0xaa, 0xff}
+	outline.StrokeWidth = 1.4
+	outline.CornerRadius = 3
+
+	divider := canvas.NewLine(color.NRGBA{0xaa, 0xaa, 0xaa, 0xff})
+	divider.StrokeWidth = 1.4
+
+	return &sidebarToggleIconRenderer{
+		i:       i,
+		outline: outline,
+		divider: divider,
+		objs:    []fyne.CanvasObject{outline, divider},
+	}
+}
+
+type sidebarToggleIconRenderer struct {
+	i       *sidebarToggleIcon
+	outline *canvas.Rectangle
+	divider *canvas.Line
+	objs    []fyne.CanvasObject
+}
+
+func (r *sidebarToggleIconRenderer) Layout(size fyne.Size) {
+	const iw, ih = float32(17), float32(13)
+	x := (size.Width - iw) / 2
+	y := (size.Height - ih) / 2
+
+	r.outline.Move(fyne.NewPos(x, y))
+	r.outline.Resize(fyne.NewSize(iw, ih))
+
+	// Divider splits the box into a narrow left pane and a wider right pane.
+	dx := x + iw*0.36
+	r.divider.Position1 = fyne.NewPos(dx, y)
+	r.divider.Position2 = fyne.NewPos(dx, y+ih)
+
+	col := color.NRGBA{0xaa, 0xaa, 0xaa, 0xff}
+	if r.i.hovered {
+		col = color.NRGBA{0xff, 0xff, 0xff, 0xff}
+	}
+	r.outline.StrokeColor = col
+	r.divider.StrokeColor = col
+}
+
+func (r *sidebarToggleIconRenderer) MinSize() fyne.Size { return r.i.MinSize() }
+func (r *sidebarToggleIconRenderer) Refresh() {
+	r.Layout(r.i.Size())
+	canvas.Refresh(r.outline)
+	canvas.Refresh(r.divider)
+}
+func (r *sidebarToggleIconRenderer) Destroy()                     {}
+func (r *sidebarToggleIconRenderer) Objects() []fyne.CanvasObject { return r.objs }
+
+const (
+	sidebarExpandedW  = float32(230)
+	sidebarCollapsedW = float32(44) // narrow strip that keeps the chevron reachable
+)
+
+// splitView is a two-pane layout (sidebar | main) whose sidebar width is a plain
+// animatable field. Its renderer's Refresh only re-runs Layout (Move/Resize) and
+// marks the canvas dirty — it never re-rasterizes children. That makes width
+// animation a GPU repaint (cached textures) instead of a full content re-render,
+// which is what made the old approach lag.
+type splitView struct {
+	widget.BaseWidget
+	bg       fyne.CanvasObject
+	content  fyne.CanvasObject
+	chevron  fyne.CanvasObject
+	sep      fyne.CanvasObject
+	main     fyne.CanvasObject
+	sidebarW float32
+}
+
+func newSplitView(bg, content, chevron, sep, main fyne.CanvasObject, initW float32) *splitView {
+	s := &splitView{bg: bg, content: content, chevron: chevron, sep: sep, main: main, sidebarW: initW}
+	s.ExtendBaseWidget(s)
+	return s
+}
+
+func (s *splitView) setSidebarW(w float32) {
+	s.sidebarW = w
+	s.Refresh() // → renderer.Refresh → Layout + canvas dirty
+}
+
+func (s *splitView) MinSize() fyne.Size {
+	return fyne.NewSize(sidebarExpandedW+420, 420)
+}
+
+func (s *splitView) CreateRenderer() fyne.WidgetRenderer {
+	return &splitRenderer{
+		s: s,
+		// chevron last so it draws on top, even where it pokes past the boundary.
+		objs: []fyne.CanvasObject{s.bg, s.content, s.sep, s.main, s.chevron},
+	}
+}
+
+type splitRenderer struct {
+	s    *splitView
+	objs []fyne.CanvasObject
+}
+
+func (r *splitRenderer) Layout(size fyne.Size) {
+	s := r.s
+	w := s.sidebarW
+
+	s.bg.Move(fyne.NewPos(0, 0))
+	s.bg.Resize(fyne.NewSize(w, size.Height))
+
+	// Content tracks w exactly, same as bg. It's a VScroll, which clips its
+	// child to its own bounds regardless of the child's natural size — so this
+	// is true geometric clipping, not a z-order trick. (Previously content was
+	// pinned at the expanded width and only hidden by main drawing on top of
+	// it, but main isn't fully opaque, so the locked-width content bled
+	// through during the slide — visible as the sidebar "overlapping" main.)
+	s.content.Move(fyne.NewPos(0, 0))
+	s.content.Resize(fyne.NewSize(w, size.Height))
+
+	// Separator at the boundary.
+	s.sep.Move(fyne.NewPos(w-1, 0))
+	s.sep.Resize(fyne.NewSize(1, size.Height))
+
+	// Chevron: top-right inside the sidebar, at any width (open, collapsed, or mid-animation).
+	ch := s.chevron.MinSize()
+	s.chevron.Resize(ch)
+	s.chevron.Move(fyne.NewPos(w-ch.Width-8, 12))
+
+	s.main.Move(fyne.NewPos(w, 0))
+	s.main.Resize(fyne.NewSize(size.Width-w, size.Height))
+}
+
+func (r *splitRenderer) MinSize() fyne.Size { return r.s.MinSize() }
+func (r *splitRenderer) Refresh() {
+	r.Layout(r.s.Size())
+	// Repaint every object that Layout moved/resized. Without refreshing main, the
+	// painter keeps its old position from cache and it only snaps into place once
+	// the animation ends — so the centre area must be refreshed alongside the bg to
+	// slide in sync. This stays cheap: thumbnails are small and the scroll culls
+	// off-screen cards, so only the few visible ones repaint per frame.
+	canvas.Refresh(r.s.bg)
+	canvas.Refresh(r.s.content)
+	canvas.Refresh(r.s.sep)
+	canvas.Refresh(r.s.chevron)
+	canvas.Refresh(r.s.main)
+}
+func (r *splitRenderer) Destroy()                     {}
+func (r *splitRenderer) Objects() []fyne.CanvasObject { return r.objs }
 
 // newNumericStepper returns a [−] [entry] [+] s row clamped to [minVal, maxVal].
 func newNumericStepper(initial, minVal, maxVal int, onChange func(int)) fyne.CanvasObject {
@@ -414,6 +683,17 @@ func newNumericStepper(initial, minVal, maxVal int, onChange func(int)) fyne.Can
 	}
 
 	entry.OnChanged = func(s string) {
+		// Strip any non-digit characters; SetText re-triggers OnChanged with the clean value.
+		filtered := ""
+		for _, r := range s {
+			if r >= '0' && r <= '9' {
+				filtered += string(r)
+			}
+		}
+		if filtered != s {
+			entry.SetText(filtered)
+			return
+		}
 		n, err := strconv.Atoi(s)
 		if err == nil && n >= minVal && n <= maxVal {
 			v = n
@@ -423,9 +703,9 @@ func newNumericStepper(initial, minVal, maxVal int, onChange func(int)) fyne.Can
 		}
 	}
 
-	decBtn := widget.NewButtonWithIcon("", theme.ContentRemoveIcon(), func() { update(v - 1) })
+	decBtn := newButtonWithIcon("", theme.ContentRemoveIcon(), func() { update(v - 1) })
 	decBtn.Importance = widget.LowImportance
-	incBtn := widget.NewButtonWithIcon("", theme.ContentAddIcon(), func() { update(v + 1) })
+	incBtn := newButtonWithIcon("", theme.ContentAddIcon(), func() { update(v + 1) })
 	incBtn.Importance = widget.LowImportance
 
 	return container.NewBorder(nil, nil, decBtn,
@@ -458,36 +738,6 @@ func (ui *RecordingUI) updateStatusIndicator(recording, paused, flash bool) {
 		ui.statusDot.FillColor = next
 		ui.statusDot.Refresh()
 	})
-}
-
-func (ui *RecordingUI) updateRegionLabel() {
-	if ui.regionLabel == nil {
-		return
-	}
-	region := ui.config.GetRegion()
-	label := "Full Screen"
-	if region != "" {
-		label = region
-	}
-	ui.runOnMain(func() {
-		ui.regionLabel.SetText(label)
-	})
-}
-
-func (ui *RecordingUI) selectRegion() {
-	if ui.mainWin == nil {
-		return
-	}
-	selector := newRegionSelector(ui.app, ui.mainWin, func(region string) {
-		ui.config.SetRegion(region)
-		ui.updateRegionLabel()
-	}, nil)
-	selector.Show()
-}
-
-func (ui *RecordingUI) clearRegion() {
-	ui.config.SetRegion("")
-	ui.updateRegionLabel()
 }
 
 func (ui *RecordingUI) syncQuickControls() {
@@ -536,14 +786,28 @@ func (ui *RecordingUI) refreshRecordingsList() {
 	ui.mu.Lock()
 	videosDir := ui.videosDir
 	ui.mu.Unlock()
-	
+
 	if videosDir == "" {
 		videosDir, _ = ui.ensureVideosDir()
 	}
-	
+	screenshotsDir, _ := ui.ensureScreenshotsDir()
+
 	ui.runOnMain(func() {
 		if ui.recordingsList != nil {
-			ui.recordingsList.refresh(videosDir)
+			ui.recordingsList.refresh(videosDir, screenshotsDir)
+		}
+	})
+}
+
+func (ui *RecordingUI) restoreMainWindow() {
+	ui.runOnMain(func() {
+		if ui.mainWin != nil {
+			ui.mu.Lock()
+			ui.windowVisible = true
+			ui.mu.Unlock()
+			ui.mainWin.Show()
+			ui.mainWin.RequestFocus()
+			ui.updateTray()
 		}
 	})
 }
@@ -566,7 +830,7 @@ func (ui *RecordingUI) handleStart() {
 	}
 	ui.mu.Unlock()
 
-	// Hide main window when starting recording
+	// Hide main window so it doesn't appear in the region-selector background.
 	ui.runOnMain(func() {
 		if ui.mainWin != nil {
 			ui.mu.Lock()
@@ -576,37 +840,69 @@ func (ui *RecordingUI) handleStart() {
 			ui.updateTray()
 		}
 	})
+	time.Sleep(200 * time.Millisecond)
 
-	delay := ui.config.GetRecordDelay()
-	if delay == 0 {
-		go ui.startRecording()
+	// Capture the current screen as the region-selector background.
+	screenW, screenH := getScreenSize()
+	tmpBg := fmt.Sprintf("/tmp/swiftcap_rec_bg_%d.png", time.Now().UnixNano())
+	_ = takeScreenshot(screenW, screenH, tmpBg)
+
+	// Show the interactive region selector (blocks until user confirms or cancels).
+	// Recording: only Rectangle (selected area) + Full Screen — no freeform/markup.
+	region := showSnipOverlay(ui.app, screenW, screenH, tmpBg,
+		[]snipMode{snipRect, snipFullscreen})
+	os.Remove(tmpBg)
+
+	if region == "" {
+		// User cancelled region selection.
+		ui.cancelPendingRecording()
+		ui.restoreMainWindow()
 		return
 	}
 
-	ui.runOnMain(func() {
-		ui.countdown = newCountdownOverlay(ui.app, delay, func() {
+	// Markup output is not applicable for recording.
+	if strings.HasPrefix(region, "file:") {
+		os.Remove(strings.TrimPrefix(region, "file:"))
+		ui.cancelPendingRecording()
+		ui.restoreMainWindow()
+		return
+	}
+
+	// Treat fullscreen selection as "no explicit region" so the recorder
+	// auto-detects (same as when nothing was configured beforehand).
+	if region == fmt.Sprintf("%dx%d+0+0", screenW, screenH) {
+		ui.config.SetRegion("")
+	} else {
+		ui.config.SetRegion(region)
+	}
+
+	// Optional delay countdown before recording starts.
+	delay := ui.config.GetRecordDelay()
+	if delay > 0 {
+		cancelled := make(chan bool, 1)
+		banner := newCountdownBanner(ui.app, delay, "Recording starts in", func() {
 			ui.mu.Lock()
 			ui.countdown = nil
 			ui.mu.Unlock()
-			go ui.startRecording()
+			cancelled <- false
 		}, func() {
 			ui.mu.Lock()
 			ui.countdown = nil
 			ui.mu.Unlock()
-			ui.cancelPendingRecording()
-			// Show window again if cancelled
-			ui.runOnMain(func() {
-				if ui.mainWin != nil {
-					ui.mu.Lock()
-					ui.windowVisible = true
-					ui.mu.Unlock()
-					ui.mainWin.Show()
-					ui.mainWin.RequestFocus()
-					ui.updateTray()
-				}
-			})
+			cancelled <- true
 		})
-	})
+		ui.mu.Lock()
+		ui.countdown = banner
+		ui.mu.Unlock()
+
+		if <-cancelled {
+			ui.cancelPendingRecording()
+			ui.restoreMainWindow()
+			return
+		}
+	}
+
+	ui.startRecording() // already in a goroutine via go ui.handleStart()
 }
 
 func (ui *RecordingUI) handleStop() {
@@ -697,7 +993,7 @@ func (ui *RecordingUI) handleStop() {
 		}
 	})
 	
-	ui.showToast(finalPath)
+	ui.showPreviewModal(finalPath, false)
 	ui.refreshUI()
 }
 
@@ -1126,6 +1422,39 @@ func lookupXDGVideos() string {
 	return path
 }
 
+func lookupXDGPictures() string {
+	cmd := exec.Command("xdg-user-dir", "PICTURES")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	path := strings.TrimSpace(string(out))
+	if path == "" {
+		return ""
+	}
+	return path
+}
+
+func (ui *RecordingUI) ensureScreenshotsDir() (string, error) {
+	dir := os.Getenv("SWIFTCAP_SCREENSHOTS_DIR")
+	if dir == "" {
+		if xdg := lookupXDGPictures(); xdg != "" {
+			dir = xdg
+		} else {
+			home, _ := os.UserHomeDir()
+			if home != "" {
+				dir = filepath.Join(home, "Pictures")
+			} else {
+				dir = "./screenshots"
+			}
+		}
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
 func (ui *RecordingUI) resolveCLIBinary() (string, error) {
 	ui.mu.Lock()
 	if ui.cliPath != "" {
@@ -1415,10 +1744,17 @@ func (ui *RecordingUI) refreshUI() {
 				ui.pauseBtn.SetText("  Pause")
 			}
 		}
+		// Hide settings when a recording is active — options can't be changed mid-session.
+		if ui.settingsCard != nil {
+			if recording || paused || finalizing {
+				ui.settingsCard.Hide()
+			} else {
+				ui.settingsCard.Show()
+			}
+		}
 	})
 	ui.updateStatusIndicator(recording, paused, flash)
 	ui.syncQuickControls()
-	ui.updateRegionLabel()
 	ui.refreshConfigSummary()
 	ui.updateTray()
 }
@@ -1455,66 +1791,81 @@ func (ui *RecordingUI) updateTrayMenu(recording, paused bool, elapsed int, final
 	ui.desktopApp.SetSystemTrayMenu(ui.buildTrayMenu(recording, paused, elapsed, finalizing))
 }
 
+// buildTrayMenu builds a context-aware tray menu: it shows only the actions that
+// apply to the current state (idle / recording / paused / finalizing) rather
+// than a fixed list of mostly-disabled items, and gives each entry an icon.
 func (ui *RecordingUI) buildTrayMenu(recording, paused bool, elapsed int, finalizing bool) *fyne.Menu {
-	elapsedItem := fyne.NewMenuItem(fmt.Sprintf("Elapsed: %s", formatElapsed(elapsed)), nil)
-	elapsedItem.Disabled = true
-
-	startItem := fyne.NewMenuItem("Start Recording", func() { go ui.handleStart() })
-	stopItem := fyne.NewMenuItem("Stop Recording", func() { go ui.handleStop() })
-	pauseItem := fyne.NewMenuItem("Pause Recording", func() { go ui.handlePause() })
-	resumeItem := fyne.NewMenuItem("Resume Recording", func() { go ui.handleResume() })
-	
 	ui.mu.Lock()
 	visible := ui.windowVisible
 	ui.mu.Unlock()
-	
-	showHideItem := fyne.NewMenuItem("Show Window", func() {
-		ui.runOnMain(func() {
-			if ui.mainWin != nil {
-				ui.mu.Lock()
-				if ui.windowVisible {
-					ui.mainWin.Hide()
-					ui.windowVisible = false
-				} else {
-					ui.mainWin.Show()
-					ui.mainWin.RequestFocus()
-					ui.windowVisible = true
-				}
-				ui.mu.Unlock()
-				ui.updateTray()
-			}
-		})
-	})
-	
-	quitItem := fyne.NewMenuItem("Quit", func() {
-		ui.runOnMain(func() {
-			ui.app.Quit()
-		})
-	})
 
-	startItem.Disabled = recording || paused || finalizing
-	stopItem.Disabled = !recording && !paused
-	pauseItem.Disabled = !recording
-	resumeItem.Disabled = !paused
-	
+	showHide := fyne.NewMenuItem("Show Window", ui.toggleWindowFromTray)
+	showHide.Icon = theme.VisibilityIcon()
 	if visible {
-		showHideItem.Label = "Hide Window"
-	} else {
-		showHideItem.Label = "Show Window"
+		showHide.Label = "Hide Window"
+		showHide.Icon = theme.VisibilityOffIcon()
 	}
 
-	return fyne.NewMenu("SwiftCap",
-		elapsedItem,
-		fyne.NewMenuItemSeparator(),
-		startItem,
-		stopItem,
-		pauseItem,
-		resumeItem,
-		fyne.NewMenuItemSeparator(),
-		showHideItem,
-		fyne.NewMenuItemSeparator(),
-		quitItem,
-	)
+	quit := fyne.NewMenuItem("Quit", func() { ui.runOnMain(ui.app.Quit) })
+	quit.Icon = theme.LogoutIcon()
+
+	sep := fyne.NewMenuItemSeparator()
+
+	var items []*fyne.MenuItem
+	switch {
+	case finalizing:
+		status := fyne.NewMenuItem("Finishing recording…", nil)
+		status.Disabled = true
+		items = []*fyne.MenuItem{status, sep, showHide, quit}
+
+	case recording && !paused:
+		status := fyne.NewMenuItem("Recording   "+formatElapsed(elapsed), nil)
+		status.Icon = theme.MediaRecordIcon()
+		status.Disabled = true
+		pause := fyne.NewMenuItem("Pause", func() { go ui.handlePause() })
+		pause.Icon = theme.MediaPauseIcon()
+		stop := fyne.NewMenuItem("Stop Recording", func() { go ui.handleStop() })
+		stop.Icon = theme.MediaStopIcon()
+		items = []*fyne.MenuItem{status, sep, pause, stop, sep, showHide, quit}
+
+	case paused:
+		status := fyne.NewMenuItem("Paused   "+formatElapsed(elapsed), nil)
+		status.Icon = theme.MediaPauseIcon()
+		status.Disabled = true
+		resume := fyne.NewMenuItem("Resume", func() { go ui.handleResume() })
+		resume.Icon = theme.MediaPlayIcon()
+		stop := fyne.NewMenuItem("Stop Recording", func() { go ui.handleStop() })
+		stop.Icon = theme.MediaStopIcon()
+		items = []*fyne.MenuItem{status, sep, resume, stop, sep, showHide, quit}
+
+	default: // idle
+		shot := fyne.NewMenuItem("Take Screenshot", func() { go ui.handleScreenshot() })
+		shot.Icon = theme.MediaPhotoIcon()
+		rec := fyne.NewMenuItem("Start Recording", func() { go ui.handleStart() })
+		rec.Icon = theme.MediaRecordIcon()
+		items = []*fyne.MenuItem{shot, rec, sep, showHide, quit}
+	}
+
+	return fyne.NewMenu("SwiftCap", items...)
+}
+
+func (ui *RecordingUI) toggleWindowFromTray() {
+	ui.runOnMain(func() {
+		if ui.mainWin == nil {
+			return
+		}
+		ui.mu.Lock()
+		if ui.windowVisible {
+			ui.mainWin.Hide()
+			ui.windowVisible = false
+		} else {
+			ui.mainWin.Show()
+			ui.mainWin.RequestFocus()
+			ui.windowVisible = true
+		}
+		ui.mu.Unlock()
+		ui.updateTray()
+	})
 }
 
 func (ui *RecordingUI) showInfo(title, msg string) {
@@ -1552,7 +1903,7 @@ func (ui *RecordingUI) handleScreenshot() {
 	}
 	ui.mu.Unlock()
 
-	// Hide main window so it doesn't appear in the screenshot
+	// Hide main window so it doesn't appear in the screenshot.
 	ui.runOnMain(func() {
 		if ui.mainWin != nil {
 			ui.mu.Lock()
@@ -1563,33 +1914,18 @@ func (ui *RecordingUI) handleScreenshot() {
 	})
 	time.Sleep(180 * time.Millisecond)
 
-	// Capture the current screen for the overlay background
+	// Capture the current screen for the overlay background.
 	screenW, screenH := getScreenSize()
 	tmpFile := fmt.Sprintf("/tmp/swiftcap_snap_%d.png", time.Now().UnixNano())
 	_ = takeScreenshot(screenW, screenH, tmpFile)
 
-	// Show the snipping overlay on the main thread; block until user selects
-	resultCh := make(chan string, 1)
-	ui.runOnMain(func() {
-		win := ui.app.NewWindow("")
-		win.SetPadded(false)
-		win.SetFixedSize(true)
-		win.SetFullScreen(true)
-
-		overlay := newRegionOverlayWidget(tmpFile, screenW, screenH, func(region string) {
-			win.Close()
-			os.Remove(tmpFile)
-			resultCh <- region
-		})
-		win.SetContent(overlay)
-		win.Canvas().Focus(overlay)
-		win.Show()
-	})
-
-	region := <-resultCh
+	// Show the snipping overlay (blocks until user selects or cancels).
+	// Screenshot: full mode set including the beta Markup annotation tool.
+	region := showSnipOverlay(ui.app, screenW, screenH, tmpFile,
+		[]snipMode{snipRect, snipFreeform, snipFullscreen, snipMarkup})
+	os.Remove(tmpFile)
 
 	if region == "" {
-		// User cancelled — restore the main window
 		ui.runOnMain(func() {
 			if ui.mainWin != nil {
 				ui.mu.Lock()
@@ -1603,13 +1939,46 @@ func (ui *RecordingUI) handleScreenshot() {
 	}
 
 	// Markup mode produces a pre-composited file rather than a region string.
+	// No delay applies — the file is already fully composed.
 	if strings.HasPrefix(region, "file:") {
 		tmpPath := strings.TrimPrefix(region, "file:")
 		ui.saveMarkupCapture(tmpPath)
 		return
 	}
 
-	// Capture the selected region
+	// Shot delay: user selected the region, now has X seconds to set up the
+	// scene (open menus, hover over elements, etc.) before capture fires.
+	if delay := ui.config.GetShotDelay(); delay > 0 {
+		cancelled := make(chan bool, 1)
+		banner := newCountdownBanner(ui.app, delay, "Screenshot in", func() {
+			ui.mu.Lock()
+			ui.countdown = nil
+			ui.mu.Unlock()
+			cancelled <- false
+		}, func() {
+			ui.mu.Lock()
+			ui.countdown = nil
+			ui.mu.Unlock()
+			cancelled <- true
+		})
+		ui.mu.Lock()
+		ui.countdown = banner
+		ui.mu.Unlock()
+
+		if <-cancelled {
+			ui.runOnMain(func() {
+				if ui.mainWin != nil {
+					ui.mu.Lock()
+					ui.windowVisible = true
+					ui.mu.Unlock()
+					ui.mainWin.Show()
+					ui.mainWin.RequestFocus()
+				}
+			})
+			return
+		}
+	}
+
 	ui.captureScreenshotWithRegion(region)
 }
 
@@ -1618,7 +1987,7 @@ func (ui *RecordingUI) handleScreenshot() {
 func (ui *RecordingUI) saveMarkupCapture(tmpPath string) {
 	defer os.Remove(tmpPath)
 
-	dir, err := ui.ensureVideosDir()
+	dir, err := ui.ensureScreenshotsDir()
 	if err != nil {
 		ui.runOnMain(func() {
 			if ui.mainWin != nil {
@@ -1663,13 +2032,14 @@ func (ui *RecordingUI) saveMarkupCapture(tmpPath string) {
 			ui.mainWin.Show()
 			ui.mainWin.RequestFocus()
 		}
-		ui.showToast(outPath)
+		ui.showPreviewModal(outPath, true)
 	})
 	ui.refreshRecordingsList()
+	notifyScreenshotSaved(outPath)
 }
 
 func (ui *RecordingUI) captureScreenshotWithRegion(region string) {
-	dir, err := ui.ensureVideosDir()
+	dir, err := ui.ensureScreenshotsDir()
 	if err != nil {
 		ui.runOnMain(func() {
 			if ui.mainWin != nil {
@@ -1748,12 +2118,27 @@ func (ui *RecordingUI) captureScreenshotWithRegion(region string) {
 			ui.mu.Unlock()
 			ui.mainWin.Show()
 		}
-		ui.showToast(path)
+		ui.showPreviewModal(path, true)
 	})
 	ui.refreshRecordingsList()
+	notifyScreenshotSaved(path)
 }
 
-var sidebarBgColor = color.NRGBA{0x1a, 0x1a, 0x1a, 0xff}
+// notifyScreenshotSaved copies the saved screenshot to the clipboard and
+// fires a desktop notification confirming both. Best-effort and non-blocking
+// — a missing xclip/wl-copy/notification daemon shouldn't affect the capture.
+func notifyScreenshotSaved(path string) {
+	go func() {
+		name := filepath.Base(path)
+		if err := copyImageToClipboard(path); err != nil {
+			_ = sendNotification("Screenshot saved", name)
+			return
+		}
+		_ = sendNotification("Screenshot saved and copied to clipboard", name)
+	}()
+}
+
+var sidebarBgColor = color.NRGBA{0x24, 0x24, 0x24, 0xff}
 
 // stripANSI removes ANSI terminal escape sequences from s.
 func stripANSI(s string) string {

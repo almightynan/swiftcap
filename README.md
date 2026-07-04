@@ -1,93 +1,80 @@
+<div align="center">
+
 # swiftcap
-swiftcap is a lightweight screen utility tool targeting Linux (with growing cross-platform support). The CLI recorder is designed for speed and low resource usage, while the UI front-end focuses on a simple workflow: countdown, record, pause/resume, and quick access to completed captures.
 
-> swift = fast, cap = capture.
+Fast, lightweight screen recorder and screenshot tool for Linux.
 
----
+[![Go Version](https://img.shields.io/github/go-mod/go-version/almightynan/swiftcap?logo=go&logoColor=white)](go.mod)
+[![License](https://img.shields.io/github/license/almightynan/swiftcap?color=blue)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Linux-333?logo=linux&logoColor=white)](#)
+[![Built with Fyne](https://img.shields.io/badge/built%20with-Fyne-7c4dff)](https://fyne.io)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#contributing)
+[![Last Commit](https://img.shields.io/github/last-commit/almightynan/swiftcap)](https://github.com/almightynan/swiftcap/commits)
 
-## Layout
+</div>
 
-```
-cmd/
-    swiftcap/     # CLI entrypoint
-    swiftcap-ui/  # Go desktop UI wrapper around the CLI
-internal/         # Shared packages (cli parsing, portal helpers, recorders, GUI logic, etc.)
-packaging/        # Packaging metadata
-scripts/          # Build helpers
-```
+swiftcap records your screen and takes screenshots on X11 and Wayland. It ships a CLI (`swiftcap`) for scripting and a desktop app (`swiftcap-ui`) built with [Fyne](https://fyne.io).
 
-Everything in this repository is pure Go – no C or C++ sources remain.
+## Features
 
----
+- Screen recording on X11 (x11grab) and Wayland (xdg-desktop-portal)
+- Region, freeform, and full-screen capture
+- Pause and resume, with segments joined on stop
+- Screenshots copied to the clipboard with a desktop notification
+- System tray controls with a live timer
+- In-app preview with a built-in video player
+- Countdown before capture
 
-## CLI (`cmd/swiftcap`)
+## Install
 
-### Highlights
-- Screen recording via ffmpeg on X11, Wayland screencasting via xdg-desktop-portal.
-- Screenshot capture for X11/Wayland/fallback modes.
-- Audio capture (PulseAudio/PipeWire) with bitrate, region, cursor, thread, and duration controls.
-- Minimal runtime deps beyond ffmpeg + portal stacks.
-
-### Dependencies
-- Go 1.22+
-- ffmpeg
-- gstreamer1.0, gst-plugins-base, gst-plugins-good, gst-plugins-bad
-- xdg-desktop-portal (+ backend) and PipeWire
-
-#### Debian/Ubuntu helper
-```
-sudo apt install ffmpeg gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
-                 gstreamer1.0-plugins-bad xdg-desktop-portal pipewire
+```bash
+git clone https://github.com/almightynan/swiftcap.git
+cd swiftcap
+./scripts/install.sh
 ```
 
-### Build
+The installer detects your package manager (apt, dnf, pacman, zypper, apk), pulls in the runtime dependencies, builds both binaries, and adds a desktop entry. It needs Go 1.22+.
 
-```
-cd scripts
-./build_static.sh   # produces ./swiftcap
-```
+Common flags:
 
-### Usage
-
-```
-swiftcap record --out out.mp4 --fps 60 --region 1280x720+0+0 --audio on --container mp4
-swiftcap screenshot --out shot.png --region 1280x720+0+0 --format png
+```bash
+./scripts/install.sh --prefix ~/.local   # install somewhere else
+./scripts/install.sh --no-deps           # skip dependency install
 ```
 
-Run `swiftcap --help` for the full flag set.
+Uninstall with `./scripts/uninstall.sh`.
 
----
+## Usage
 
-## UI (`cmd/swiftcap-ui`)
+Launch the app from your menu or run `swiftcap-ui`. Set the FPS and output directory, then start a recording or grab a screenshot.
 
-The UI is now written in Go (Fyne). It wraps the CLI, providing:
+The CLI works standalone:
 
-- Countdown overlay (click to abort) before recording starts.
-- System tray integration with dynamic icons, elapsed timer, start/stop/pause/resume entries.
-- Pause/resume implemented by segmenting recordings and concatenating with ffmpeg on stop.
-- Toast notification inside the app with “Open Folder / Open File”.
-- Same video directory + ffmpeg requirements as the CLI.
-
-### Build & run
-
-```
-go build ./cmd/swiftcap-ui
-./swiftcap-ui
+```bash
+swiftcap record --out out.mp4 --fps 60 --audio on
+swiftcap record --out out.mp4 --region 1280x720+0+0
+swiftcap screenshot --out shot.png
+swiftcap --help
 ```
 
-The UI searches for the `swiftcap` CLI in:
-1. `SWIFTCAP_CLI_PATH` (if set),
-2. The same directory as the UI binary,
-3. `$PATH`.
+## Dependencies
 
----
+- `ffmpeg` (required)
+- `xclip` or `wl-clipboard` for clipboard support
+- `xdg-desktop-portal`, `pipewire`, and `gstreamer` plugins for Wayland capture
+- OpenGL and X11 libs for the GUI (`libGL`, `libX11`, `libXcursor`, `libXrandr`, `libXi`)
 
-## Packaging
+On Fedora and RHEL, `ffmpeg` lives in [RPM Fusion](https://rpmfusion.org/Configuration) rather than the base repos.
 
-Packaging metadata lives under `packaging/`. See `scripts/` for static build helpers and dependency checks.
+## Build from source
 
----
+```bash
+go build -o swiftcap ./cmd/swiftcap
+go build -o swiftcap-ui ./cmd/swiftcap-ui
+```
+
+The CLI is pure Go. The UI uses cgo to link against system GL/X11.
 
 ## Contributing
 
-Open issues/PRs for bugs or feature ideas. Please make sure `go test ./...` and linting pass before submitting.
+Issues and pull requests are welcome. Please run `go build ./...` and `go test ./...` before opening a PR.

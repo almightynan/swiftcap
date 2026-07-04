@@ -9,6 +9,26 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
+// newVertSep is a 1-logical-unit-wide widget rendered as a solid color bar.
+// Use it as a visual divider between layout columns.
+type vertSep struct {
+	widget.BaseWidget
+	col color.NRGBA
+}
+
+func newVertSep(col color.NRGBA) *vertSep {
+	v := &vertSep{col: col}
+	v.ExtendBaseWidget(v)
+	return v
+}
+
+func (v *vertSep) MinSize() fyne.Size { return fyne.NewSize(1, 0) }
+
+func (v *vertSep) CreateRenderer() fyne.WidgetRenderer {
+	bg := canvas.NewRectangle(v.col)
+	return widget.NewSimpleRenderer(bg)
+}
+
 var (
 	bentoSurface = color.NRGBA{0x2a, 0x2a, 0x2a, 0xff}
 	bentoBorder  = color.NRGBA{0x3e, 0x3e, 0x3e, 0xff}
@@ -57,6 +77,17 @@ func bentoAccentDot(accent color.NRGBA) fyne.CanvasObject {
 	return container.NewGridWrap(fyne.NewSize(10, 10), dot)
 }
 
+
+// sidebarCard wraps body in a curved, bordered surface card sized to its content.
+// Used in the sidebar to visually group related controls.
+func sidebarCard(body fyne.CanvasObject) fyne.CanvasObject {
+	surf := canvas.NewRectangle(color.NRGBA{0x2e, 0x2e, 0x2e, 0xff})
+	surf.CornerRadius = 10
+	surf.StrokeColor = color.NRGBA{0x40, 0x40, 0x40, 0xff}
+	surf.StrokeWidth = 1
+	inner := container.NewPadded(body)
+	return container.NewPadded(container.NewStack(surf, inner))
+}
 
 func blendColor(a, b color.NRGBA, t float64) color.NRGBA {
 	t = clamp01(t)

@@ -56,7 +56,6 @@ const (
 )
 
 func tbPanelH() float32 { return tbBtnH + tbPadY*2 }
-func tbPanelW() float32 { return 4*tbBtnW + 5*tbPadX }
 
 // ─── regionSelector ─────────────────────────────────────────────────────────
 
@@ -114,16 +113,16 @@ func (rs *regionSelector) showBuiltinSelector() {
 	}
 
 	resultCh := make(chan string, 1)
-	win := rs.app.NewWindow("")
-	win.SetPadded(false)
-	win.SetFixedSize(true)
-	win.SetFullScreen(true)
+	win := newFullscreenOverlayWindow(rs.app, screenW, screenH)
 
-	overlay := newRegionOverlayWidget(tmpFile, screenW, screenH, func(region string) {
-		win.Close()
-		os.Remove(tmpFile)
-		resultCh <- region
-	})
+	// Recording: only Rectangle (selected area) + Full Screen. Freeform and the
+	// beta Markup tool are screenshot-only and don't apply to video capture.
+	overlay := newRegionOverlayWidget(tmpFile, screenW, screenH,
+		[]snipMode{snipRect, snipFullscreen}, func(region string) {
+			win.Close()
+			os.Remove(tmpFile)
+			resultCh <- region
+		})
 	win.SetContent(overlay)
 	win.Canvas().Focus(overlay)
 	win.Show()
@@ -145,14 +144,11 @@ func (rs *regionSelector) showBuiltinSelector() {
 
 // showSnipOverlay presents the snipping-tool overlay and returns the selected
 // region string ("WxH+X+Y") or "" on cancel. Must be called from a goroutine.
-func showSnipOverlay(a fyne.App, screenW, screenH int, bgFile string) string {
+func showSnipOverlay(a fyne.App, screenW, screenH int, bgFile string, modes []snipMode) string {
 	resultCh := make(chan string, 1)
-	win := a.NewWindow("")
-	win.SetPadded(false)
-	win.SetFixedSize(true)
-	win.SetFullScreen(true)
+	win := newFullscreenOverlayWindow(a, screenW, screenH)
 
-	overlay := newRegionOverlayWidget(bgFile, screenW, screenH, func(region string) {
+	overlay := newRegionOverlayWidget(bgFile, screenW, screenH, modes, func(region string) {
 		win.Close()
 		resultCh <- region
 	})
@@ -160,6 +156,25 @@ func showSnipOverlay(a fyne.App, screenW, screenH int, bgFile string) string {
 	win.Canvas().Focus(overlay)
 	win.Show()
 	return <-resultCh
+}
+
+// newFullscreenOverlayWindow returns a borderless window sized to the whole
+// screen. It deliberately avoids SetFullScreen: Fyne's glfw driver shows a
+// window in its normal decorated state first and only switches to real
+// fullscreen ~100ms later (internal/driver/glfw/window.go), producing a visible
+// "Fyne Application" title-bar flash. A splash window is undecorated from the
+// instant it's created, so there's no flash — it just covers the screen.
+func newFullscreenOverlayWindow(a fyne.App, screenW, screenH int) fyne.Window {
+	var win fyne.Window
+	if drv, ok := a.Driver().(desktop.Driver); ok {
+		win = drv.CreateSplashWindow()
+	} else {
+		win = a.NewWindow("")
+	}
+	win.SetPadded(false)
+	win.SetFixedSize(true)
+	win.Resize(fyne.NewSize(float32(screenW), float32(screenH)))
+	return win
 }
 
 // ─── regionOverlayWidget ────────────────────────────────────────────────────
@@ -172,6 +187,11 @@ type regionOverlayWidget struct {
 	screenW int
 	screenH int
 	onDone  func(string)
+
+	// modes is the ordered set of selection modes shown in the top toolbar.
+	// Recording uses only {Rectangle, Full Screen}; screenshots use all four
+	// (markup is a screenshot-only, beta annotation feature).
+	modes []snipMode
 
 	mu          sync.Mutex
 	mode        snipMode
@@ -210,17 +230,33 @@ type regionOverlayWidget struct {
 	mkStartY    float32
 	mkCurX      float32
 	mkCurY      float32
-	mkPoints    []image.Point
-	mkHoverCode int
+	mkPoints       []image.Point
+	mkHoverCode     int
+	showExitConfirm bool // confirmation panel for "exit markup with unsaved changes"
+	pendingExit     bool // set on PRESS; onDone called on RELEASE to avoid GLFW crash
+
+	// confirm dialog animation (not mutex-protected — animation goroutine + main thread)
+	confirmAnimT float32
+	confirmAnim  *fyne.Animation
+
+	// Rect-mode handle-drag state (guarded by mu)
+	handleDrag   int          // -1 = none, 0-7 = index of handle being dragged
+	handleOffset fyne.Position // click-point offset from handle centre (prevents jump)
+	hdMinX, hdMinY float32    // rectangle bounds at the moment drag began
+	hdMaxX, hdMaxY float32
 }
 
-func newRegionOverlayWidget(bgFile string, screenW, screenH int, onDone func(string)) *regionOverlayWidget {
+func newRegionOverlayWidget(bgFile string, screenW, screenH int, modes []snipMode, onDone func(string)) *regionOverlayWidget {
+	if len(modes) == 0 {
+		modes = []snipMode{snipRect, snipFreeform, snipFullscreen, snipMarkup}
+	}
 	w := &regionOverlayWidget{
 		bgFile:      bgFile,
 		screenW:     screenW,
 		screenH:     screenH,
 		onDone:      onDone,
-		mode:        snipRect,
+		modes:       modes,
+		mode:        modes[0],
 		hoverBtn:    -1,
 		markTool:    mkToolBrush,
 		markColor:   color.NRGBA{0xff, 0x33, 0x33, 0xff},
@@ -229,6 +265,7 @@ func newRegionOverlayWidget(bgFile string, screenW, screenH int, onDone func(str
 		markFillCol: color.NRGBA{0xff, 0x33, 0x33, 0x60},
 		markBlurType: 0,
 		mkHoverCode: mkHitNone,
+		handleDrag:  -1,
 	}
 	if f, err := os.Open(bgFile); err == nil {
 		img, _, _ := image.Decode(f)
@@ -241,8 +278,27 @@ func newRegionOverlayWidget(bgFile string, screenW, screenH int, onDone func(str
 
 // ── toolbar geometry ─────────────────────────────────────────────────────────
 
+// numModes is the count of toolbar buttons for this overlay.
+func (w *regionOverlayWidget) numModes() int { return len(w.modes) }
+
+// tbPanelW is the toolbar width, sized to the number of active modes.
+func (w *regionOverlayWidget) tbPanelW() float32 {
+	n := float32(w.numModes())
+	return n*tbBtnW + (n+1)*tbPadX
+}
+
+// modeIndex returns the button position of mode m (0 if not present).
+func (w *regionOverlayWidget) modeIndex(m snipMode) int {
+	for i, mm := range w.modes {
+		if mm == m {
+			return i
+		}
+	}
+	return 0
+}
+
 func (w *regionOverlayWidget) toolbarPanelXY() (panelX, panelY float32) {
-	panelX = (w.Size().Width - tbPanelW()) / 2
+	panelX = (w.Size().Width - w.tbPanelW()) / 2
 	panelY = tbTopOff
 	return
 }
@@ -257,14 +313,14 @@ func (w *regionOverlayWidget) btnRect(i int) (x, y, bw, bh float32) {
 }
 
 func (w *regionOverlayWidget) hitTest(pos fyne.Position) int {
-	for i := 0; i < 4; i++ {
+	for i := 0; i < w.numModes(); i++ {
 		x, y, bw, bh := w.btnRect(i)
 		if pos.X >= x && pos.X < x+bw && pos.Y >= y && pos.Y < y+bh {
 			return i
 		}
 	}
 	px, py := w.toolbarPanelXY()
-	if pos.X >= px && pos.X < px+tbPanelW() && pos.Y >= py && pos.Y < py+tbPanelH() {
+	if pos.X >= px && pos.X < px+w.tbPanelW() && pos.Y >= py && pos.Y < py+tbPanelH() {
 		return -2
 	}
 	return -1
@@ -275,7 +331,7 @@ func (w *regionOverlayWidget) selectMode(newMode snipMode) {
 	// Compute target X before locking, using current widget size
 	targetX := float32(0)
 	if w.Size().Width > 0 {
-		bx, _, _, _ := w.btnRect(int(newMode))
+		bx, _, _, _ := w.btnRect(w.modeIndex(newMode))
 		targetX = bx
 	}
 	startX := w.indicX
@@ -294,9 +350,19 @@ func (w *regionOverlayWidget) selectMode(newMode snipMode) {
 	w.mode = newMode
 	w.started = false
 	w.mouseDown = false
-	w.selComplete = false
+	// Fullscreen has no drag step — mark selection complete immediately.
+	w.selComplete = newMode == snipFullscreen
 	w.freePoints = w.freePoints[:0]
 	w.mu.Unlock()
+}
+
+// Cursor shows a pointer while hovering a top-toolbar mode button so those
+// buttons feel clickable; elsewhere the default cursor is kept for selection.
+func (w *regionOverlayWidget) Cursor() desktop.Cursor {
+	if w.hoverBtn >= 0 {
+		return desktop.PointerCursor
+	}
+	return desktop.DefaultCursor
 }
 
 // ── mouse ────────────────────────────────────────────────────────────────────
@@ -312,17 +378,8 @@ func (w *regionOverlayWidget) MouseDown(ev *desktop.MouseEvent) {
 	}
 	hit := w.hitTest(ev.Position)
 	if hit >= 0 {
-		if snipMode(hit) == snipFullscreen {
-			w.done = true
-			sw, sh := w.screenW, w.screenH
-			w.mu.Unlock()
-			if w.onDone != nil {
-				w.onDone(fmt.Sprintf("%dx%d+0+0", sw, sh))
-			}
-			return
-		}
 		w.mu.Unlock()
-		w.selectMode(snipMode(hit))
+		w.selectMode(w.modes[hit])
 		return
 	}
 	if hit == -2 {
@@ -330,7 +387,10 @@ func (w *regionOverlayWidget) MouseDown(ev *desktop.MouseEvent) {
 		return
 	}
 
-	// Markup mode: delegate all canvas events to markup handler
+	// Markup mode: delegate to the markup handler.
+	// pendingExit is set inside handleMarkupMouseDown when exit is confirmed;
+	// onDone is called from MouseUp (the RELEASE) so that GLFW's GetCursorPos
+	// at window.go:509 has already run before the window is destroyed.
 	if w.mode == snipMarkup {
 		w.mu.Unlock()
 		w.handleMarkupMouseDown(ev.Position)
@@ -338,7 +398,39 @@ func (w *regionOverlayWidget) MouseDown(ev *desktop.MouseEvent) {
 		return
 	}
 
-	// Canvas click — reset any complete selection and begin a new one
+	// In Rect mode with a finished selection, check whether the click lands on a
+	// resize handle before deciding to start a new selection.
+	if w.mode == snipRect && w.selComplete && w.started {
+		minX := float32(math.Min(float64(w.startX), float64(w.curX)))
+		minY := float32(math.Min(float64(w.startY), float64(w.curY)))
+		maxX := float32(math.Max(float64(w.startX), float64(w.curX)))
+		maxY := float32(math.Max(float64(w.startY), float64(w.curY)))
+		midX := (minX + maxX) / 2
+		midY := (minY + maxY) / 2
+		// TL TC TR  ML MR  BL BC BR — same order as the renderer
+		hCenters := [8][2]float32{
+			{minX, minY}, {midX, minY}, {maxX, minY},
+			{minX, midY}, {maxX, midY},
+			{minX, maxY}, {midX, maxY}, {maxX, maxY},
+		}
+		const hitR = float32(14)
+		for i, c := range hCenters {
+			dx := ev.Position.X - c[0]
+			dy := ev.Position.Y - c[1]
+			if dx*dx+dy*dy <= hitR*hitR {
+				w.handleDrag = i
+				w.handleOffset = fyne.NewPos(ev.Position.X-c[0], ev.Position.Y-c[1])
+				w.hdMinX, w.hdMinY = minX, minY
+				w.hdMaxX, w.hdMaxY = maxX, maxY
+				w.mu.Unlock()
+				w.Refresh()
+				return
+			}
+		}
+	}
+
+	// Canvas click — reset any complete selection and begin a new one.
+	w.handleDrag = -1
 	w.selComplete = false
 	w.started = true
 	w.mouseDown = true
@@ -363,8 +455,31 @@ func (w *regionOverlayWidget) MouseUp(ev *desktop.MouseEvent) {
 	w.mu.Unlock()
 	if mode == snipMarkup {
 		w.handleMarkupMouseUp(ev.Position)
+		// Consume pendingExit set during the PRESS half of this click.
+		// Calling onDone here (RELEASE, after GLFW's GetCursorPos at line 509 has
+		// already run) avoids the nil-viewport panic in processMouseClicked.
+		w.mu.Lock()
+		pending := w.pendingExit
+		if pending {
+			w.pendingExit = false
+		}
+		w.mu.Unlock()
+		if pending && w.onDone != nil {
+			w.onDone("")
+		}
+		w.Refresh()
 		return
 	}
+	// Handle drag release — keep selComplete intact.
+	w.mu.Lock()
+	if w.handleDrag >= 0 {
+		w.handleDrag = -1
+		w.mu.Unlock()
+		w.Refresh()
+		return
+	}
+	w.mu.Unlock()
+
 	w.mu.Lock()
 	if w.done || !w.started || !w.mouseDown {
 		w.mu.Unlock()
@@ -397,6 +512,48 @@ func (w *regionOverlayWidget) MouseMoved(ev *desktop.MouseEvent) {
 	}
 
 	w.mu.Lock()
+
+	// Handle drag: resize the rect by moving only the dragged edge/corner.
+	if w.handleDrag >= 0 {
+		iMinX, iMinY := w.hdMinX, w.hdMinY
+		iMaxX, iMaxY := w.hdMaxX, w.hdMaxY
+		off := w.handleOffset
+		sz := w.Size()
+		mx := ev.Position.X - off.X
+		my := ev.Position.Y - off.Y
+		const minSel = float32(4)
+		nX0, nY0, nX1, nY1 := iMinX, iMinY, iMaxX, iMaxY
+		switch w.handleDrag {
+		case 0: // TL
+			nX0 = clamp32(mx, 0, iMaxX-minSel)
+			nY0 = clamp32(my, 0, iMaxY-minSel)
+		case 1: // TC
+			nY0 = clamp32(my, 0, iMaxY-minSel)
+		case 2: // TR
+			nX1 = clamp32(mx, iMinX+minSel, sz.Width)
+			nY0 = clamp32(my, 0, iMaxY-minSel)
+		case 3: // ML
+			nX0 = clamp32(mx, 0, iMaxX-minSel)
+		case 4: // MR
+			nX1 = clamp32(mx, iMinX+minSel, sz.Width)
+		case 5: // BL
+			nX0 = clamp32(mx, 0, iMaxX-minSel)
+			nY1 = clamp32(my, iMinY+minSel, sz.Height)
+		case 6: // BC
+			nY1 = clamp32(my, iMinY+minSel, sz.Height)
+		case 7: // BR
+			nX1 = clamp32(mx, iMinX+minSel, sz.Width)
+			nY1 = clamp32(my, iMinY+minSel, sz.Height)
+		}
+		w.startX, w.startY = nX0, nY0
+		w.curX, w.curY = nX1, nY1
+		w.mouseX = ev.Position.X
+		w.mouseY = ev.Position.Y
+		w.mu.Unlock()
+		w.Refresh()
+		return
+	}
+
 	w.mouseX = ev.Position.X
 	w.mouseY = ev.Position.Y
 
@@ -463,15 +620,17 @@ func (w *regionOverlayWidget) TypedKey(ev *fyne.KeyEvent) {
 		}
 
 		var region string
-		if mode == snipFreeform && len(freePoints) >= 3 {
+		switch {
+		case mode == snipFullscreen:
+			region = fmt.Sprintf("%dx%d+0+0", w.screenW, w.screenH)
+		case mode == snipFreeform && len(freePoints) >= 3:
 			// Polygon-mask the bgImage directly; no second x11grab needed.
 			if tmpPath, err := saveFreeformTmpFile(w.bgImage, freePoints, scale); err == nil {
 				region = "file:" + tmpPath
 			} else {
-				// Fallback to bounding-box rectangle on error.
 				region = snipComputeRegion(mode, sx, sy, cx, cy, freePoints, scale)
 			}
-		} else {
+		default:
 			region = snipComputeRegion(mode, sx, sy, cx, cy, freePoints, scale)
 		}
 
@@ -586,6 +745,7 @@ type regionOverlayRenderer struct {
 	helpMain *canvas.Text
 	helpSub  *canvas.Text
 
+	instrBg   *canvas.Rectangle
 	instrText *canvas.Text
 	crossH    *canvas.Line
 	crossV    *canvas.Line
@@ -637,6 +797,18 @@ type regionOverlayRenderer struct {
 	mkPreviewLine  *canvas.Line
 	mkLastPtN      int
 
+	// Exit markup button and confirmation dialog
+	mkExitBg        *canvas.Rectangle
+	mkExitLbl       *canvas.Text
+	mkConfirmBg     *canvas.Rectangle // full-screen dim overlay
+	mkConfirmCard   *canvas.Rectangle // dialog card
+	mkConfirmTitle  *canvas.Text      // "Discard Changes?"
+	mkConfirmMsg    *canvas.Text      // body text
+	mkConfirmYesBg  *canvas.Rectangle
+	mkConfirmYesLbl *canvas.Text
+	mkConfirmNoBg   *canvas.Rectangle
+	mkConfirmNoLbl  *canvas.Text
+
 	objects []fyne.CanvasObject
 }
 
@@ -687,8 +859,13 @@ func (w *regionOverlayWidget) CreateRenderer() fyne.WidgetRenderer {
 	helpSub.TextSize = 14
 	helpSub.Alignment = fyne.TextAlignCenter
 
+	instrBg := canvas.NewRectangle(color.NRGBA{0x12, 0x12, 0x12, 0xcc})
+	instrBg.CornerRadius = 20
+	instrBg.StrokeColor = color.NRGBA{0x44, 0x44, 0x44, 0x88}
+	instrBg.StrokeWidth = 1
+
 	instrText := canvas.NewText("", color.NRGBA{0xff, 0xff, 0xff, 0xbb})
-	instrText.TextSize = 13
+	instrText.TextSize = 12
 	instrText.Alignment = fyne.TextAlignCenter
 
 	crossH := canvas.NewLine(color.NRGBA{0xff, 0xff, 0xff, 0x28})
@@ -710,6 +887,7 @@ func (w *regionOverlayWidget) CreateRenderer() fyne.WidgetRenderer {
 		handles:   handles,
 		helpMain:  helpMain,
 		helpSub:   helpSub,
+		instrBg:   instrBg,
 		instrText: instrText,
 		crossH:    crossH,
 		crossV:    crossV,
@@ -728,7 +906,7 @@ func (w *regionOverlayWidget) CreateRenderer() fyne.WidgetRenderer {
 		if pw == 0 || ph == 0 {
 			return color.Black
 		}
-		const regionW = 32.0
+		const regionW = 40.0 // must equal regionH * (magW/magH) = 24*(160/96) for square pixels
 		const regionH = 24.0
 		cx := r.magCX
 		cy := r.magCY
@@ -784,14 +962,21 @@ func (w *regionOverlayWidget) CreateRenderer() fyne.WidgetRenderer {
 	r.indicator = canvas.NewRectangle(color.NRGBA{0x2a, 0x5e, 0xc8, 0xff})
 	r.indicator.CornerRadius = 7
 
+	// Button slots are a fixed [4] array, but content maps to this overlay's
+	// active mode set; slots past len(modes) are built with placeholder content
+	// and kept hidden by the toolbar layout.
 	for i := 0; i < 4; i++ {
 		bg := canvas.NewRectangle(color.Transparent)
 		bg.CornerRadius = 7
 		r.btnBg[i] = bg
 
-		r.btnIcon[i] = widget.NewIcon(snipIcon(snipMode(i)))
+		m := snipMode(i)
+		if i < len(r.w.modes) {
+			m = r.w.modes[i]
+		}
+		r.btnIcon[i] = widget.NewIcon(snipIcon(m))
 
-		lbl := canvas.NewText(snipLabels[i], color.NRGBA{0xcc, 0xcc, 0xcc, 0xff})
+		lbl := canvas.NewText(snipLabels[m], color.NRGBA{0xcc, 0xcc, 0xcc, 0xff})
 		lbl.TextSize = 11
 		lbl.Alignment = fyne.TextAlignCenter
 		r.btnLabel[i] = lbl
@@ -812,7 +997,7 @@ func (w *regionOverlayWidget) CreateRenderer() fyne.WidgetRenderer {
 	objs = append(objs, sizeBg, sizeText)
 	objs = append(objs, crossH, crossV)
 	objs = append(objs, helpMain, helpSub)
-	objs = append(objs, instrText)
+	objs = append(objs, instrBg, instrText)
 	objs = append(objs, r.magShadow, r.magRaster, r.magBorder)
 	objs = append(objs, r.magCrossH, r.magCrossV)
 	objs = append(objs, r.coordBg, r.coordText)
@@ -839,6 +1024,47 @@ func (w *regionOverlayWidget) CreateRenderer() fyne.WidgetRenderer {
 		objs = append(objs, sw)
 	}
 	objs = append(objs, r.mkPreviewRect, r.mkPreviewCircle, r.mkPreviewLine)
+
+	// ── Exit button (top-left pill) ──────────────────────────────────────────────
+	r.mkExitBg = canvas.NewRectangle(color.NRGBA{0x26, 0x26, 0x26, 0xf0})
+	r.mkExitBg.StrokeColor = color.NRGBA{0x50, 0x50, 0x50, 0xff}
+	r.mkExitBg.StrokeWidth = 1
+	r.mkExitBg.CornerRadius = 8
+	r.mkExitLbl = canvas.NewText("Exit Markup", color.NRGBA{0xcc, 0xcc, 0xcc, 0xff})
+	r.mkExitLbl.TextSize = 12
+	r.mkExitLbl.Alignment = fyne.TextAlignCenter
+
+	// ── Confirmation dialog ───────────────────────────────────────────────────────
+	r.mkConfirmBg = canvas.NewRectangle(color.NRGBA{0, 0, 0, 0xb8}) // dim overlay
+	r.mkConfirmCard = canvas.NewRectangle(color.NRGBA{0x1e, 0x1e, 0x1e, 0xff})
+	r.mkConfirmCard.StrokeColor = color.NRGBA{0x50, 0x50, 0x50, 0xff}
+	r.mkConfirmCard.StrokeWidth = 1
+	r.mkConfirmCard.CornerRadius = 14
+	r.mkConfirmTitle = canvas.NewText("Discard Changes?", color.NRGBA{0xff, 0xff, 0xff, 0xff})
+	r.mkConfirmTitle.TextSize = 16
+	r.mkConfirmTitle.TextStyle = fyne.TextStyle{Bold: true}
+	r.mkConfirmTitle.Alignment = fyne.TextAlignLeading
+	r.mkConfirmMsg = canvas.NewText("", color.NRGBA{0xaa, 0xaa, 0xaa, 0xff})
+	r.mkConfirmMsg.TextSize = 13
+	r.mkConfirmMsg.Alignment = fyne.TextAlignLeading
+	r.mkConfirmNoBg = canvas.NewRectangle(color.NRGBA{0x38, 0x38, 0x38, 0xff})
+	r.mkConfirmNoBg.CornerRadius = 8
+	r.mkConfirmNoLbl = canvas.NewText("Keep Editing", color.NRGBA{0xee, 0xee, 0xee, 0xff})
+	r.mkConfirmNoLbl.TextSize = 13
+	r.mkConfirmNoLbl.TextStyle = fyne.TextStyle{Bold: true}
+	r.mkConfirmNoLbl.Alignment = fyne.TextAlignCenter
+	r.mkConfirmYesBg = canvas.NewRectangle(color.NRGBA{0xaa, 0x18, 0x18, 0xff})
+	r.mkConfirmYesBg.CornerRadius = 8
+	r.mkConfirmYesLbl = canvas.NewText("Discard & Exit", color.NRGBA{0xff, 0xff, 0xff, 0xff})
+	r.mkConfirmYesLbl.TextSize = 13
+	r.mkConfirmYesLbl.TextStyle = fyne.TextStyle{Bold: true}
+	r.mkConfirmYesLbl.Alignment = fyne.TextAlignCenter
+
+	objs = append(objs, r.mkExitBg, r.mkExitLbl)
+	// confirm overlay → card → text → buttons (z-order matters)
+	objs = append(objs, r.mkConfirmBg, r.mkConfirmCard, r.mkConfirmTitle, r.mkConfirmMsg)
+	objs = append(objs, r.mkConfirmNoBg, r.mkConfirmNoLbl, r.mkConfirmYesBg, r.mkConfirmYesLbl)
+
 	// top toolbar (on top of everything)
 	objs = append(objs, r.toolbarBg, r.indicator)
 	for _, b := range r.btnBg {
@@ -879,7 +1105,7 @@ func (r *regionOverlayRenderer) Layout(size fyne.Size) {
 
 	// Initialize indicator position on first layout
 	if r.w.indicX == 0 && size.Width > 0 {
-		bx, _, _, _ := r.w.btnRect(int(r.w.mode))
+		bx, _, _, _ := r.w.btnRect(r.w.modeIndex(r.w.mode))
 		r.w.indicX = bx
 	}
 
@@ -902,16 +1128,22 @@ func (r *regionOverlayRenderer) paint(size fyne.Size) {
 		r.crossH.Position2 = fyne.NewPos(0, 0)
 		r.crossV.Position1 = fyne.NewPos(0, 0)
 		r.crossV.Position2 = fyne.NewPos(0, 0)
+		// Hide the top toolbar in markup mode — Exit button handles navigation.
+		zero2 := fyne.NewSize(0, 0)
+		r.toolbarBg.Resize(zero2)
+		r.indicator.Resize(zero2)
+		for i := range r.btnBg {
+			r.btnBg[i].Resize(zero2)
+			r.btnIcon[i].Resize(zero2)
+			r.btnLabel[i].Resize(zero2)
+		}
 		r.paintMarkupMode(size)
-		indicX := w.indicX
-		w.mu.Lock()
-		hoverBtn := w.hoverBtn
-		w.mu.Unlock()
-		r.paintTopToolbar(size, mode, hoverBtn, indicX)
 		return
 	}
 
-	// Hide all markup-mode objects when not in markup mode
+	// Hide all markup-mode objects when not in markup mode.
+	// canvas.Rectangle: Resize(zero) is sufficient — zero-area rects are invisible.
+	// canvas.Text: Resize(zero) does NOT suppress rendering; must use .Hide() instead.
 	zero := fyne.NewSize(0, 0)
 	r.mkBufRaster.Resize(zero)
 	r.mkBarBg.Resize(zero)
@@ -919,29 +1151,29 @@ func (r *regionOverlayRenderer) paint(size fyne.Size) {
 		b.Resize(zero)
 	}
 	for _, l := range r.mkToolLbl {
-		l.Resize(zero)
+		l.Hide()
 	}
-	r.mkColorLbl.Resize(zero)
+	r.mkColorLbl.Hide()
 	r.mkColorSwatch.Resize(zero)
-	r.mkSizeLbl.Resize(zero)
+	r.mkSizeLbl.Hide()
 	r.mkSizeMinBg.Resize(zero)
 	r.mkSizePlusBg.Resize(zero)
-	r.mkSizeMinLbl.Resize(zero)
-	r.mkSizePlusLbl.Resize(zero)
+	r.mkSizeMinLbl.Hide()
+	r.mkSizePlusLbl.Hide()
 	r.mkFillTogBg.Resize(zero)
-	r.mkFillTogLbl.Resize(zero)
-	r.mkFillLbl.Resize(zero)
+	r.mkFillTogLbl.Hide()
+	r.mkFillLbl.Hide()
 	r.mkFillSwatch.Resize(zero)
 	for _, b := range r.mkBlurBg {
 		b.Resize(zero)
 	}
 	for _, l := range r.mkBlurLbl {
-		l.Resize(zero)
+		l.Hide()
 	}
 	r.mkUndoBg.Resize(zero)
-	r.mkUndoLbl.Resize(zero)
+	r.mkUndoLbl.Hide()
 	r.mkCaptureBg.Resize(zero)
-	r.mkCaptureLbl.Resize(zero)
+	r.mkCaptureLbl.Hide()
 	r.mkPalBg.Resize(zero)
 	for _, sw := range r.mkPalSwatch {
 		sw.Resize(zero)
@@ -950,6 +1182,16 @@ func (r *regionOverlayRenderer) paint(size fyne.Size) {
 	r.mkPreviewCircle.Resize(zero)
 	r.mkPreviewLine.Position1 = fyne.NewPos(0, 0)
 	r.mkPreviewLine.Position2 = fyne.NewPos(0, 0)
+	r.mkExitBg.Resize(zero)
+	r.mkExitLbl.Hide()
+	r.mkConfirmBg.Resize(zero)
+	r.mkConfirmCard.Resize(zero)
+	r.mkConfirmTitle.Hide()
+	r.mkConfirmMsg.Hide()
+	r.mkConfirmYesBg.Resize(zero)
+	r.mkConfirmYesLbl.Hide()
+	r.mkConfirmNoBg.Resize(zero)
+	r.mkConfirmNoLbl.Hide()
 
 	w.mu.Lock()
 	started := w.started
@@ -963,6 +1205,12 @@ func (r *regionOverlayRenderer) paint(size fyne.Size) {
 	w.mu.Unlock()
 
 	indicX := w.indicX // safe: only written on main thread by animation
+	// Snap indicator to the correct button position on first render (before any animation).
+	if w.modeAnim == nil && size.Width > 0 {
+		bx, _, _, _ := w.btnRect(w.modeIndex(mode))
+		w.indicX = bx
+		indicX = bx
+	}
 
 	dim := color.NRGBA{0, 0, 0, 160}
 	selColor := color.NRGBA{0x1a, 0x6b, 0xc4, 0xff}
@@ -982,6 +1230,19 @@ func (r *regionOverlayRenderer) paint(size fyne.Size) {
 	tbBottom := tbTopOff + tbPanelH() + 4
 
 	switch {
+	case mode == snipFullscreen:
+		// Fullscreen: no drag needed, just confirm.
+		r.helpMain.Text = "Full Screen Capture"
+		r.helpMain.Move(fyne.NewPos(0, size.Height/2-36))
+		r.helpMain.Resize(fyne.NewSize(size.Width, 28))
+		r.helpSub.Text = "Press Enter to capture the entire screen"
+		r.helpSub.Move(fyne.NewPos(0, size.Height/2))
+		r.helpSub.Resize(fyne.NewSize(size.Width, 20))
+		canvas.Refresh(r.helpMain)
+		canvas.Refresh(r.helpSub)
+		r.helpMain.Show()
+		r.helpSub.Show()
+		r.instrText.Text = "Enter to capture  ·  Esc"
 	case !started:
 		// Pre-selection: show large centered instructions
 		switch mode {
@@ -998,22 +1259,38 @@ func (r *regionOverlayRenderer) paint(size fyne.Size) {
 		canvas.Refresh(r.helpSub)
 		r.helpMain.Show()
 		r.helpSub.Show()
-		r.instrText.Text = "ESC to cancel"
+		r.instrText.Text = "Esc to cancel"
+	case selComplete && mode == snipRect:
+		r.helpMain.Hide()
+		r.helpSub.Hide()
+		r.instrText.Text = "Enter to capture  ·  Drag handles  ·  Click to redo  ·  Esc"
 	case selComplete:
 		r.helpMain.Hide()
 		r.helpSub.Hide()
-		r.instrText.Text = "Press Enter to capture  ·  Click to redo selection  ·  ESC to cancel"
+		r.instrText.Text = "Enter to capture  ·  Click to redo  ·  Esc"
 	default:
 		r.helpMain.Hide()
 		r.helpSub.Hide()
 		if mode == snipFreeform {
-			r.instrText.Text = "Release to finish drawing  ·  ESC to cancel"
+			r.instrText.Text = "Release to finish  ·  Esc"
 		} else {
-			r.instrText.Text = "Drag to select  ·  ESC to cancel"
+			r.instrText.Text = "Drag to select  ·  Esc"
 		}
 	}
-	r.instrText.Move(fyne.NewPos(0, size.Height-34))
-	r.instrText.Resize(fyne.NewSize(size.Width, 22))
+	{
+		measured := fyne.MeasureText(r.instrText.Text, r.instrText.TextSize, r.instrText.TextStyle)
+		pillW := measured.Width + 40
+		if pillW > size.Width-40 {
+			pillW = size.Width - 40
+		}
+		pillH := float32(30)
+		pillX := size.Width/2 - pillW/2
+		pillY := size.Height - pillH - 14
+		r.instrBg.Move(fyne.NewPos(pillX, pillY))
+		r.instrBg.Resize(fyne.NewSize(pillW, pillH))
+		r.instrText.Move(fyne.NewPos(pillX, pillY+(pillH-measured.Height)/2))
+		r.instrText.Resize(fyne.NewSize(pillW, measured.Height+2))
+	}
 
 	// ── Rectangular selection ─────────────────────────────────────────────────
 	r.freeformRaster.Hide()
@@ -1060,6 +1337,7 @@ func (r *regionOverlayRenderer) paint(size fyne.Size) {
 
 			r.selRect.Move(fyne.NewPos(minX, minY))
 			r.selRect.Resize(fyne.NewSize(selW, selH))
+			canvas.Refresh(r.selRect)
 
 			// Dimension label with dark pill background
 			dimStr := fmt.Sprintf(" %d × %d ", int(selW*scale), int(selH*scale))
@@ -1080,21 +1358,28 @@ func (r *regionOverlayRenderer) paint(size fyne.Size) {
 			r.sizeText.Resize(fyne.NewSize(lblW, lblH-2))
 			canvas.Refresh(r.sizeText)
 
-			// Handle dots: TL TC TR  ML MR  BL BC BR
-			const hR = float32(5)
-			const hD = hR * 2
-			midX := minX + selW/2
-			midY := minY + selH/2
-			positions := [8][2]float32{
-				{minX, minY}, {midX, minY}, {maxX, minY},
-				{minX, midY}, {maxX, midY},
-				{minX, maxY}, {midX, maxY}, {maxX, maxY},
-			}
-			for i, pos := range positions {
-				r.handles[i].FillColor = color.NRGBA{0xff, 0xff, 0xff, 0xff}
-				r.handles[i].StrokeColor = selColor
-				r.handles[i].Move(fyne.NewPos(pos[0]-hR, pos[1]-hR))
-				r.handles[i].Resize(fyne.NewSize(hD, hD))
+			// Handle dots — only shown once the selection is complete so they
+			// clearly signal "drag me to adjust". TL TC TR  ML MR  BL BC BR.
+			if selComplete {
+				const hR = float32(6)
+				const hD = hR * 2
+				midX := minX + selW/2
+				midY := minY + selH/2
+				positions := [8][2]float32{
+					{minX, minY}, {midX, minY}, {maxX, minY},
+					{minX, midY}, {maxX, midY},
+					{minX, maxY}, {midX, maxY}, {maxX, maxY},
+				}
+				for i, pos := range positions {
+					r.handles[i].FillColor = color.NRGBA{0xff, 0xff, 0xff, 0xff}
+					r.handles[i].StrokeColor = selColor
+					r.handles[i].Move(fyne.NewPos(pos[0]-hR, pos[1]-hR))
+					r.handles[i].Resize(fyne.NewSize(hD, hD))
+				}
+			} else {
+				for i := range r.handles {
+					r.handles[i].Resize(zero)
+				}
 			}
 		}
 	} else {
@@ -1234,7 +1519,8 @@ func (r *regionOverlayRenderer) paint(size fyne.Size) {
 	r.magCrossH.Position2 = fyne.NewPos(magX+magW, magY+magH/2)
 	r.magCrossV.Position1 = fyne.NewPos(magX+magW/2, magY)
 	r.magCrossV.Position2 = fyne.NewPos(magX+magW/2, magY+magH)
-	r.coordText.Text = fmt.Sprintf("  X:%-6dY:%-6d", int(mx*scale), int(my*scale))
+	r.coordText.Text = fmt.Sprintf("  X: %-5d  Y: %-5d", int(mx*scale), int(my*scale))
+	canvas.Refresh(r.coordText)
 	coordY := magY + magH + 2
 	r.coordBg.Move(fyne.NewPos(magX-1, coordY-1))
 	r.coordBg.Resize(fyne.NewSize(magW+2, coordH+2))
@@ -1249,7 +1535,7 @@ func (r *regionOverlayRenderer) paintTopToolbar(size fyne.Size, mode snipMode, h
 	w := r.w
 	panelX, panelY := w.toolbarPanelXY()
 	r.toolbarBg.Move(fyne.NewPos(panelX, panelY))
-	r.toolbarBg.Resize(fyne.NewSize(tbPanelW(), tbPanelH()))
+	r.toolbarBg.Resize(fyne.NewSize(w.tbPanelW(), tbPanelH()))
 
 	// Sliding indicator
 	_, by, bw2, bh2 := w.btnRect(0) // y/size same for all buttons
@@ -1263,20 +1549,34 @@ func (r *regionOverlayRenderer) paintTopToolbar(size fyne.Size, mode snipMode, h
 	totalContent := iconSz + gap + lblH2
 	iconTopOff := (bh2 - totalContent) / 2
 
+	n := w.numModes()
+	zero := fyne.NewSize(0, 0)
 	for i := 0; i < 4; i++ {
+		// Slots past the active mode count are hidden (fixed [4] array).
+		if i >= n {
+			r.btnBg[i].Resize(zero)
+			r.btnIcon[i].Hide()
+			r.btnLabel[i].Hide()
+			continue
+		}
+		r.btnIcon[i].Show()
+		r.btnLabel[i].Show()
+
 		bx, by2, bw3, bh3 := w.btnRect(i)
 		r.btnBg[i].Move(fyne.NewPos(bx, by2))
 		r.btnBg[i].Resize(fyne.NewSize(bw3, bh3))
 
-		isSelected := mode == snipMode(i)
+		isSelected := mode == w.modes[i]
 		isHover := hoverBtn == i
 
 		if isHover && !isSelected {
 			r.btnBg[i].FillColor = color.NRGBA{0x38, 0x38, 0x38, 0xff}
+			r.btnBg[i].StrokeColor = color.NRGBA{0x55, 0x55, 0x55, 0xff}
+			r.btnBg[i].StrokeWidth = 1
 		} else {
 			r.btnBg[i].FillColor = color.Transparent
+			r.btnBg[i].StrokeWidth = 0
 		}
-		r.btnBg[i].StrokeWidth = 0
 
 		// Icon
 		r.btnIcon[i].Move(fyne.NewPos(bx+bw3/2-iconSz/2, by2+iconTopOff))
@@ -1287,6 +1587,9 @@ func (r *regionOverlayRenderer) paintTopToolbar(size fyne.Size, mode snipMode, h
 		case isSelected:
 			r.btnLabel[i].Color = color.NRGBA{0xff, 0xff, 0xff, 0xff}
 			r.btnLabel[i].TextStyle = fyne.TextStyle{Bold: true}
+		case isHover:
+			r.btnLabel[i].Color = color.NRGBA{0xff, 0xff, 0xff, 0xe0}
+			r.btnLabel[i].TextStyle = fyne.TextStyle{}
 		default:
 			r.btnLabel[i].Color = color.NRGBA{0xcc, 0xcc, 0xcc, 0xff}
 			r.btnLabel[i].TextStyle = fyne.TextStyle{}
@@ -1311,6 +1614,16 @@ func intMax(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func clamp32(v, lo, hi float32) float32 {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }
 
 func drawThickLine(img *image.RGBA, x0, y0, x1, y1 int, c color.NRGBA, thickness int) {

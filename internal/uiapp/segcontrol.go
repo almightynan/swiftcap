@@ -6,6 +6,7 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
+	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/widget"
 )
 
@@ -65,6 +66,9 @@ func (s *SegControl) SelectTab(idx int) {
 	s.anim.Curve = fyne.AnimationEaseInOut
 	s.anim.Start()
 }
+
+// Cursor shows a pointer so the segmented tabs feel clickable.
+func (s *SegControl) Cursor() desktop.Cursor { return desktop.PointerCursor }
 
 func (s *SegControl) Tapped(ev *fyne.PointEvent) {
 	if len(s.Items) == 0 {
