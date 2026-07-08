@@ -4,7 +4,6 @@ import (
 	"image/color"
 	"strconv"
 	"time"
-
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
@@ -42,7 +41,7 @@ type settingsWindow struct {
 	niceEntry    *widget.Entry
 
 	saveBtn     *hoverButton
-	dirtyText   *canvas.Text
+	dirtyBox    *fyne.Container
 	revertTimer *time.Timer
 }
 
@@ -115,14 +114,20 @@ func (ui *RecordingUI) showSettings() {
 		}
 	}
 
-	sw.dirtyText = canvas.NewText("", color.NRGBA{0xf1, 0xc0, 0x5a, 0xff})
-	sw.dirtyText.TextSize = 12
+	// Unsaved-changes indicator: a warning icon + amber bold label, hidden while
+	// clean. (Uses a real vector icon rather than a "●" glyph, which the font
+	// renders as a tofu box.)
+	dirtyLbl := canvas.NewText("Unsaved changes", color.NRGBA{0xf1, 0xc0, 0x5a, 0xff})
+	dirtyLbl.TextSize = 13
+	dirtyLbl.TextStyle = fyne.TextStyle{Bold: true}
+	sw.dirtyBox = container.NewHBox(widget.NewIcon(theme.WarningIcon()), dirtyLbl)
+	sw.dirtyBox.Hide()
 
 	sw.saveBtn = newButton("Save", func() { sw.onSave() })
 	sw.saveBtn.Importance = widget.HighImportance
 	sw.saveBtn.Disable() // nothing to save until something changes
 
-	cancelBtn := newButton("Cancel", func() {
+	closeBtn := newButton("Close", func() {
 		if sw.isDirty() {
 			dialog.ShowConfirm("Discard changes?",
 				"You have unsaved changes. Discard them and close settings?",
@@ -136,8 +141,8 @@ func (ui *RecordingUI) showSettings() {
 		closeSettings()
 	})
 	buttonRow := container.NewBorder(nil, nil,
-		container.NewCenter(sw.dirtyText),
-		container.NewHBox(cancelBtn, sw.saveBtn), nil)
+		container.NewCenter(sw.dirtyBox),
+		container.NewHBox(closeBtn, sw.saveBtn), nil)
 
 	fields := container.NewVBox(
 		sw.tipRow("FPS", tipFPS, sw.fpsEntry),
@@ -319,13 +324,12 @@ func (sw *settingsWindow) refreshDirty() {
 	sw.saveBtn.SetText("Save")
 	sw.saveBtn.Importance = widget.HighImportance
 	if dirty {
-		sw.dirtyText.Text = "●  Unsaved changes"
+		sw.dirtyBox.Show()
 		sw.saveBtn.Enable()
 	} else {
-		sw.dirtyText.Text = ""
+		sw.dirtyBox.Hide()
 		sw.saveBtn.Disable()
 	}
-	sw.dirtyText.Refresh()
 	sw.saveBtn.Refresh()
 }
 
@@ -337,8 +341,7 @@ func (sw *settingsWindow) onSave() {
 		sw.ui.persistConfig()
 	}
 
-	sw.dirtyText.Text = ""
-	sw.dirtyText.Refresh()
+	sw.dirtyBox.Hide()
 	// Stay enabled during the flash so the success (green) color shows — a
 	// disabled button renders grey regardless of importance. Re-tapping it just
 	// re-saves the same values, which is harmless.

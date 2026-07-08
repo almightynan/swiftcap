@@ -254,39 +254,94 @@ func mkMosaicBlur(img *image.RGBA, bg image.Image, wx0, wy0, wx1, wy1, blockSize
 	}
 }
 
-// mkBoxBlur applies a box blur using the bg image.
+// mkBoxBlur applies a box blur of the given radius over the bg image region.
+//
+// It's separable: each source pixel is sampled once, then a horizontal and a
+// vertical sliding-window pass (via prefix sums) produce the average — so the
+// cost is O(area) regardless of radius, instead of O(area·radius²) which froze
+// the app for large brushes.
 func mkBoxBlur(img *image.RGBA, bg image.Image, wx0, wy0, wx1, wy1, radius int) {
-	if wx0 > wx1 { wx0, wx1 = wx1, wx0 }
-	if wy0 > wy1 { wy0, wy1 = wy1, wy0 }
-	if radius < 1 { radius = 1 }
+	if wx0 > wx1 {
+		wx0, wx1 = wx1, wx0
+	}
+	if wy0 > wy1 {
+		wy0, wy1 = wy1, wy0
+	}
+	if radius < 1 {
+		radius = 1
+	}
 	b := img.Bounds()
+	x0, y0 := max(wx0, b.Min.X), max(wy0, b.Min.Y)
+	x1, y1 := min(wx1, b.Max.X), min(wy1, b.Max.Y)
+	if x1 <= x0 || y1 <= y0 {
+		return
+	}
+	W, H, R := x1-x0, y1-y0, radius
+
 	bgB := bg.Bounds()
 	bw, bh := bgB.Dx(), bgB.Dy()
 	mw, mh := b.Dx(), b.Dy()
+	sample := func(ix, iy int) (float64, float64, float64) {
+		bx, by := ix*bw/mw, iy*bh/mh
+		if bx < 0 {
+			bx = 0
+		} else if bx >= bw {
+			bx = bw - 1
+		}
+		if by < 0 {
+			by = 0
+		} else if by >= bh {
+			by = bh - 1
+		}
+		rr, gg, bb, _ := bg.At(bgB.Min.X+bx, bgB.Min.Y+by).RGBA()
+		return float64(rr >> 8), float64(gg >> 8), float64(bb >> 8)
+	}
 
-	for y := wy0; y < wy1; y++ {
-		if y < b.Min.Y || y >= b.Max.Y { continue }
-		for x := wx0; x < wx1; x++ {
-			if x < b.Min.X || x >= b.Max.X { continue }
-			var rs, gs, bs, n int64
-			for dy := -radius; dy <= radius; dy++ {
-				for dx := -radius; dx <= radius; dx++ {
-					bgX := (x + dx) * bw / mw
-					bgY := (y + dy) * bh / mh
-					if bgX < 0 { bgX = 0 }
-					if bgY < 0 { bgY = 0 }
-					if bgX >= bw { bgX = bw - 1 }
-					if bgY >= bh { bgY = bh - 1 }
-					rr, gg, bb2, _ := bg.At(bgB.Min.X+bgX, bgB.Min.Y+bgY).RGBA()
-					rs += int64(rr >> 8)
-					gs += int64(gg >> 8)
-					bs += int64(bb2 >> 8)
-					n++
-				}
-			}
-			if n > 0 {
-				img.Set(x, y, color.NRGBA{uint8(rs / n), uint8(gs / n), uint8(bs / n), 0xff})
-			}
+	// Horizontal pass: for every row in the region (padded by R vertically for
+	// the following vertical pass), sum a 2R+1 window into hbuf (W × (H+2R)).
+	sh := H + 2*R
+	rowLen := W + 2*R
+	hr := make([]float64, W*sh)
+	hg := make([]float64, W*sh)
+	hb := make([]float64, W*sh)
+	pr := make([]float64, rowLen+1)
+	pg := make([]float64, rowLen+1)
+	pb := make([]float64, rowLen+1)
+	for j := 0; j < sh; j++ {
+		iy := y0 - R + j
+		for i := 0; i < rowLen; i++ {
+			r, g, bl := sample(x0-R+i, iy)
+			pr[i+1] = pr[i] + r
+			pg[i+1] = pg[i] + g
+			pb[i+1] = pb[i] + bl
+		}
+		for k := 0; k < W; k++ {
+			idx := j*W + k
+			hr[idx] = pr[k+2*R+1] - pr[k]
+			hg[idx] = pg[k+2*R+1] - pg[k]
+			hb[idx] = pb[k+2*R+1] - pb[k]
+		}
+	}
+
+	// Vertical pass: sum a 2R+1 window down each column and write the average.
+	win := float64((2*R + 1) * (2*R + 1))
+	pcr := make([]float64, sh+1)
+	pcg := make([]float64, sh+1)
+	pcb := make([]float64, sh+1)
+	for k := 0; k < W; k++ {
+		for j := 0; j < sh; j++ {
+			idx := j*W + k
+			pcr[j+1] = pcr[j] + hr[idx]
+			pcg[j+1] = pcg[j] + hg[idx]
+			pcb[j+1] = pcb[j] + hb[idx]
+		}
+		for m := 0; m < H; m++ {
+			img.Set(x0+k, y0+m, color.NRGBA{
+				uint8((pcr[m+2*R+1] - pcr[m]) / win),
+				uint8((pcg[m+2*R+1] - pcg[m]) / win),
+				uint8((pcb[m+2*R+1] - pcb[m]) / win),
+				0xff,
+			})
 		}
 	}
 }

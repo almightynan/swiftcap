@@ -5,12 +5,14 @@ import (
 	"image/color"
 	"path/filepath"
 	"strings"
+	"time"
 
 	xdraw "golang.org/x/image/draw"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
@@ -28,22 +30,29 @@ func (ui *RecordingUI) showCaptureViewer(path string) {
 	var overlay *fyne.Container
 	var player *videoPlayer
 	var iv *imageViewer
+	var revertBtn *cleanButton
 	// current is the path being shown; it changes as the user navigates between
 	// screenshots, so the path label and Open actions read it live.
 	current := path
+
+	// closeViewer animates the modal out (startClose is wired up once the card and
+	// backdrop exist below); closing guards against double-dismiss.
+	var startClose func()
+	closing := false
 	closeViewer := func() {
-		cv.SetOnTypedKey(nil)
-		if player != nil {
-			player.destroy()
+		if closing {
+			return
 		}
-		if overlay != nil {
-			cv.Overlays().Remove(overlay)
+		closing = true
+		cv.SetOnTypedKey(nil)
+		if startClose != nil {
+			startClose()
 		}
 	}
 
 	// Header + path labels (declared early so navigation can update them).
 	nameLbl := widget.NewLabelWithStyle(filepath.Base(path), fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-	pathLbl := widget.NewLabelWithStyle(prettyPath(path), fyne.TextAlignCenter, fyne.TextStyle{Monospace: true})
+	pathLbl := widget.NewLabelWithStyle(prettyPath(path), fyne.TextAlignLeading, fyne.TextStyle{Monospace: true})
 	closeBtn := newButtonWithIcon("", theme.CancelIcon(), closeViewer)
 	closeBtn.Importance = widget.LowImportance
 	header := container.NewBorder(nil, nil, nil, closeBtn, nameLbl)
@@ -52,7 +61,7 @@ func (ui *RecordingUI) showCaptureViewer(path string) {
 	// screenshots.
 	var previewArea fyne.CanvasObject
 	if isVideo {
-		player = newVideoPlayer(ui, path)
+		player = newVideoPlayer(ui, path, 640, 400)
 		previewArea = player.object()
 	} else {
 		paths, startIdx := ui.imageCapturePaths(path)
@@ -61,33 +70,104 @@ func (ui *RecordingUI) showCaptureViewer(path string) {
 			current = np
 			nameLbl.SetText(filepath.Base(np))
 			pathLbl.SetText(prettyPath(np))
+			if revertBtn != nil {
+				if hasEditBackup(np) {
+					revertBtn.Show()
+				} else {
+					revertBtn.Hide()
+				}
+			}
 		}
 		previewArea = iv.object()
 	}
 
-	// Actions: open with the default application, or reveal in the folder.
-	openFileBtn := newButtonWithIcon("Open File", theme.FileIcon(), func() {
+	// Actions — clean, lightweight buttons: one soft-accent primary, the rest are
+	// ghost buttons that brighten on hover.
+	prim := toNRGBA(theme.PrimaryColor())
+	primHover := lighten(prim, 0x18)
+	ghost := color.NRGBA{0xff, 0xff, 0xff, 0x12}
+	ghostHover := color.NRGBA{0xff, 0xff, 0xff, 0x26}
+	white := color.NRGBA{0xff, 0xff, 0xff, 0xff}
+	dim := color.NRGBA{0xcf, 0xcf, 0xd8, 0xff}
+
+	openFileFn := func() {
 		if err := openFile(current); err != nil {
 			ui.showError("Open File", err.Error())
 			return
 		}
 		closeViewer()
-	})
-	openFileBtn.Importance = widget.HighImportance
-	openFolderBtn := newButtonWithIcon("Open Folder", theme.FolderOpenIcon(), func() {
+	}
+	openFolderFn := func() {
 		if err := openFolder(current); err != nil {
 			ui.showError("Open Folder", err.Error())
 			return
 		}
 		closeViewer()
-	})
-	actions := container.NewGridWithColumns(2, openFolderBtn, openFileBtn)
+	}
+
+	cell := func(o fyne.CanvasObject) fyne.CanvasObject {
+		return container.NewGridWrap(fyne.NewSize(146, 38), o)
+	}
+
+	var actions fyne.CanvasObject
+	if isVideo {
+		openFileBtn := newCleanButton(theme.FileIcon(), "Open File", prim, primHover, white, openFileFn)
+		openFolderBtn := newCleanButton(theme.FolderOpenIcon(), "Open Folder", ghost, ghostHover, dim, openFolderFn)
+		actions = container.NewCenter(container.NewHBox(cell(openFileBtn), cell(openFolderBtn)))
+	} else {
+		// Edit opens the markup editor; on return, reopen the viewer so it shows
+		// the edited image (and the Revert button, if edits were saved).
+		editBtn := newCleanButton(theme.DocumentCreateIcon(), "Edit", prim, primHover, white, func() {
+			p := current
+			closeViewer()
+			showMarkupEditor(ui, p, func(saved bool) {
+				if saved {
+					ui.refreshRecordingsList()
+				}
+				ui.showCaptureViewer(p)
+			})
+		})
+		openFileBtn := newCleanButton(theme.FileIcon(), "Open File", ghost, ghostHover, dim, openFileFn)
+		openFolderBtn := newCleanButton(theme.FolderOpenIcon(), "Open Folder", ghost, ghostHover, dim, openFolderFn)
+		revertBtn = newCleanButton(theme.ContentUndoIcon(), "Revert", ghost, ghostHover, dim, func() {
+			p := current
+			dialog.ShowConfirm("Revert edits?",
+				"Restore the original image and discard the edits you saved?",
+				func(ok bool) {
+					if !ok {
+						return
+					}
+					if err := revertEdit(p); err != nil {
+						ui.showError("Revert", err.Error())
+						return
+					}
+					closeViewer()
+					ui.refreshRecordingsList()
+					ui.showCaptureViewer(p)
+				}, ui.mainWin)
+		})
+		if !hasEditBackup(current) {
+			revertBtn.Hide()
+		}
+		// Revert stays natural width (unwrapped) so it collapses when hidden.
+		actions = container.NewCenter(container.NewHBox(
+			cell(editBtn), cell(openFileBtn), cell(openFolderBtn), revertBtn))
+	}
+
+	// Path shown as a subtle monospace chip with a small file icon, so it reads
+	// as a distinct element instead of loose text.
+	pathChipBg := canvas.NewRectangle(color.NRGBA{0x27, 0x27, 0x2d, 0xff})
+	pathChipBg.CornerRadius = 9
+	pathChip := container.NewStack(pathChipBg,
+		container.NewPadded(container.NewHBox(widget.NewIcon(theme.FileIcon()), pathLbl)))
+	pathRow := container.NewCenter(pathChip)
 
 	inner := container.NewVBox(
 		header,
 		widget.NewSeparator(),
 		previewArea,
-		pathLbl,
+		newHeightSpacer(2),
+		pathRow,
 		actions,
 	)
 
@@ -99,25 +179,68 @@ func (ui *RecordingUI) showCaptureViewer(path string) {
 	// A no-op tap wrapper absorbs clicks on the card so they don't fall through
 	// to the backdrop (which closes the modal).
 	card := newTapableContainer(container.NewStack(cardBg, insetBy(inner, 22)), func() {})
-	cardCentered := container.NewCenter(card)
+	// WithoutLayout lets us position the card manually so the open/close animation
+	// can slide it (Center would keep re-centering it).
+	cardLayer := container.NewWithoutLayout(card)
 
 	// Frosted backdrop: a blurred snapshot of the app behind the modal. Tapping
 	// it (outside the card) dismisses the modal.
+	var bgFade func(vis float32)
 	var bgObj fyne.CanvasObject
 	if shot := cv.Capture(); shot != nil {
 		blur := canvas.NewImageFromImage(blurredBackdrop(shot, 5))
 		blur.FillMode = canvas.ImageFillStretch
 		bgObj = blur
+		bgFade = func(vis float32) { blur.Translucency = float64(1 - vis); canvas.Refresh(blur) }
 	} else {
-		bgObj = canvas.NewRectangle(color.NRGBA{0, 0, 0, 0x99})
+		rect := canvas.NewRectangle(color.NRGBA{0, 0, 0, 0x99})
+		bgObj = rect
+		bgFade = func(vis float32) {
+			rect.FillColor = color.NRGBA{0, 0, 0, uint8(0x99 * vis)}
+			canvas.Refresh(rect)
+		}
 	}
 	backdrop := newTapableContainer(bgObj, closeViewer)
 
-	overlay = container.NewStack(backdrop, cardCentered)
+	overlay = container.NewStack(backdrop, cardLayer)
+
+	// place centers the card, offset down by yOff (for the slide).
+	place := func(yOff float32) {
+		sz := card.MinSize()
+		cs := cv.Size()
+		card.Resize(sz)
+		card.Move(fyne.NewPos((cs.Width-sz.Width)/2, (cs.Height-sz.Height)/2+yOff))
+	}
+
+	// startClose stops playback immediately (so audio doesn't linger), then
+	// animates the card out and removes the overlay.
+	startClose = func() {
+		if player != nil {
+			player.destroy()
+		}
+		anim := fyne.NewAnimation(160*time.Millisecond, func(f float32) {
+			bgFade(1 - f)
+			place(24 * f)
+			if f >= 1 {
+				cv.Overlays().Remove(overlay)
+			}
+		})
+		anim.Curve = fyne.AnimationEaseIn
+		anim.Start()
+	}
+
+	// Pre-animation state before adding (no first-frame flash), then animate in.
+	bgFade(0)
+	place(24)
 	cv.Overlays().Add(overlay)
-	// Overlays are auto-resized to the canvas on window resize, but not at Add
-	// time — size it to fill the canvas now so the backdrop covers everything.
 	overlay.Resize(cv.Size())
+	place(24)
+	openAnim := fyne.NewAnimation(200*time.Millisecond, func(f float32) {
+		bgFade(f)
+		place(24 * (1 - f))
+	})
+	openAnim.Curve = fyne.AnimationEaseOut
+	openAnim.Start()
 
 	// Keyboard shortcuts. Clearing focus ensures the canvas key handler receives
 	// them (a focused sidebar widget would otherwise swallow the key); the
@@ -287,23 +410,4 @@ func previewImageFor(path string) image.Image {
 	return loadAnyImage(path)
 }
 
-// showImageFullscreen shows img in a borderless, screen-filling lightbox.
-// Clicking anywhere or pressing Esc dismisses it.
-func showImageFullscreen(a fyne.App, img image.Image) {
-	screenW, screenH := getScreenSize()
-	win := newFullscreenOverlayWindow(a, screenW, screenH)
-
-	ci := canvas.NewImageFromImage(img)
-	ci.FillMode = canvas.ImageFillContain
-	bg := canvas.NewRectangle(color.NRGBA{0x0a, 0x0a, 0x0a, 0xff})
-
-	win.SetContent(newTapableContainer(container.NewStack(bg, ci), func() {
-		win.Close()
-	}))
-	win.Canvas().SetOnTypedKey(func(k *fyne.KeyEvent) {
-		if k.Name == fyne.KeyEscape {
-			win.Close()
-		}
-	})
-	win.Show()
-}
+// showImageFullscreen now lives in fullscreen.go (zoom-capable viewer).

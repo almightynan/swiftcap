@@ -661,6 +661,7 @@ func (r *regionOverlayRenderer) initMarkupObjects() {
 func (r *regionOverlayRenderer) paintMarkupMode(sz fyne.Size) {
 	w := r.w
 	w.mu.Lock()
+	
 	tool := w.markTool
 	col := w.markColor
 	size := w.markSize

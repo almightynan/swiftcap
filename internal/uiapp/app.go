@@ -51,7 +51,7 @@ type RecordingUI struct {
 	cursorToggle  *widget.Check
 	containerSelect *widget.Select
 
-	captureMode   int  // 0 = recording, 1 = screenshot
+	captureMode   int  // 0 = screenshot (capture), 1 = recording
 	recordPanel   *fyne.Container
 	shotPanel     *fyne.Container
 	shotActionBtn *hoverButton
@@ -330,16 +330,16 @@ func (ui *RecordingUI) buildMainWindow() {
 	)
 
 	seg := NewSegControl([]SegItem{
-		{Icon: theme.MediaRecordIcon(), Label: "Record"},
 		{Icon: theme.FileImageIcon(), Label: "Capture"},
+		{Icon: theme.MediaRecordIcon(), Label: "Record"},
 	}, func(idx int) {
 		ui.setMode(idx)
 	})
-	seg.Selected = 1 // default to Capture; ui.setMode(1) below syncs the panels
+	seg.Selected = 0 // default to Capture (left); ui.setMode(0) below syncs the panels
 
 	// Single action button — text/icon swaps instantly when mode changes.
-	ui.actionBtn = newButtonWithIcon("  Start Recording", theme.MediaRecordIcon(), func() {
-		if ui.captureMode == 0 {
+	ui.actionBtn = newButtonWithIcon("  Take Screenshot", theme.FileImageIcon(), func() {
+		if ui.captureMode == 1 {
 			go ui.handleStart()
 		} else {
 			go ui.handleScreenshot()
@@ -383,13 +383,13 @@ func (ui *RecordingUI) buildMainWindow() {
 	ui.windowVisible = true
 	ui.syncQuickControls()
 	ui.refreshConfigSummary()
-	ui.setMode(1) // default the home screen to Capture (screenshot)
+	ui.setMode(0) // default the home screen to Capture (screenshot)
 	win.Show()
 }
 
 func (ui *RecordingUI) setMode(mode int) {
 	ui.captureMode = mode
-	if mode == 0 {
+	if mode == 1 { // Record
 		ui.recordPanel.Show()
 		ui.shotPanel.Hide()
 		if ui.statusCard != nil {
@@ -399,7 +399,7 @@ func (ui *RecordingUI) setMode(mode int) {
 			ui.actionBtn.SetIcon(theme.MediaRecordIcon())
 			ui.actionBtn.SetText("  Start Recording")
 		}
-	} else {
+	} else { // Capture (screenshot)
 		ui.recordPanel.Hide()
 		ui.shotPanel.Show()
 		if ui.statusCard != nil {

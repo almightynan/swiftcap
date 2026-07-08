@@ -42,6 +42,11 @@ type videoPlayer struct {
 	seek     *widget.Slider
 	timeLbl  *widget.Label
 	volBtn   *hoverButton
+	fsBtn    *hoverButton
+
+	// Fullscreen: set on the fullscreen instance; onExitFS closes its window.
+	fullscreen bool
+	onExitFS   func()
 
 	// Seek indicator overlay (the "«  10s" flash on the video).
 	seekIndPanel *fyne.Container
@@ -71,9 +76,9 @@ type videoPlayer struct {
 	userSeeking  bool // true while the user drags the seek slider
 }
 
-func newVideoPlayer(ui *RecordingUI, path string) *videoPlayer {
+func newVideoPlayer(ui *RecordingUI, path string, maxW, maxH int) *videoPlayer {
 	w, h, fps, dur := probeVideo(path)
-	dw, dh := fitVideoSize(w, h, 620, 348)
+	dw, dh := fitVideoSize(w, h, maxW, maxH)
 
 	p := &videoPlayer{
 		ui:       ui,
@@ -88,7 +93,6 @@ func newVideoPlayer(ui *RecordingUI, path string) *videoPlayer {
 
 	p.img = canvas.NewImageFromImage(image.NewRGBA(image.Rect(0, 0, dw, dh)))
 	p.img.FillMode = canvas.ImageFillContain
-	p.img.SetMinSize(fyne.NewSize(float32(dw), float32(dh)))
 
 	// Load the first frame as a paused still (async, so opening the modal never
 	// blocks the UI thread on ffmpeg).
@@ -155,6 +159,17 @@ func newVideoPlayer(ui *RecordingUI, path string) *videoPlayer {
 	p.volBtn = newButtonWithIcon("", theme.VolumeUpIcon(), p.showVolumePopup)
 	p.volBtn.Importance = widget.LowImportance
 
+	p.fsBtn = newButtonWithIcon("", theme.ViewFullScreenIcon(), func() {
+		if p.fullscreen {
+			if p.onExitFS != nil {
+				p.onExitFS()
+			}
+			return
+		}
+		p.enterFullscreen()
+	})
+	p.fsBtn.Importance = widget.LowImportance
+
 	go p.positionTicker()
 	return p
 }
@@ -164,16 +179,31 @@ func newVideoPlayer(ui *RecordingUI, path string) *videoPlayer {
 // standard video player.
 func (p *videoPlayer) object() fyne.CanvasObject {
 	black := canvas.NewRectangle(color.NRGBA{0x0a, 0x0a, 0x0a, 0xff})
+	// In the modal the video sits at its decoded size (centred); in fullscreen it
+	// fills the whole area, contain-fit scaling it up to the screen.
+	var videoArea fyne.CanvasObject
+	if p.fullscreen {
+		videoArea = p.img // FillMode=Contain lets it fill the frame, aspect-correct
+	} else {
+		videoArea = container.NewCenter(
+			container.NewGridWrap(fyne.NewSize(float32(p.dispW), float32(p.dispH)), p.img),
+		)
+	}
 	// Clicking the picture area toggles play/pause. The control-bar widgets sit
 	// on top and consume their own taps, so only the video body triggers this.
-	frame := newTapableContainer(
-		container.NewStack(black, container.NewCenter(p.img)),
-		p.togglePlay,
-	)
+	frame := newTapableContainer(container.NewStack(black, videoArea), p.togglePlay)
+
+	// The fullscreen toggle shows "maximise" in the modal and "minimise" (restore)
+	// in the fullscreen window.
+	if p.fullscreen {
+		p.fsBtn.SetIcon(theme.ViewRestoreIcon())
+	} else {
+		p.fsBtn.SetIcon(theme.ViewFullScreenIcon())
+	}
 
 	barBg := canvas.NewRectangle(color.NRGBA{0x00, 0x00, 0x00, 0xb0})
 	left := container.NewHBox(p.playBtn, p.back10, p.fwd10)
-	right := container.NewHBox(p.timeLbl, p.volBtn)
+	right := container.NewHBox(p.timeLbl, p.volBtn, p.fsBtn)
 	bar := container.NewBorder(nil, nil, left, right, p.seek)
 	barStack := container.NewStack(barBg, container.NewPadded(bar))
 
@@ -181,6 +211,14 @@ func (p *videoPlayer) object() fyne.CanvasObject {
 	controls := container.NewVBox(layout.NewSpacer(), barStack)
 	// Seek indicator floats above everything (transient, non-interactive).
 	return container.NewStack(frame, controls, p.seekIndPanel)
+}
+
+// enterFullscreen pauses this (modal) player and opens the clip in a fullscreen
+// window, resuming from the current position.
+func (p *videoPlayer) enterFullscreen() {
+	pos := p.currentPos()
+	p.pause()
+	showVideoFullscreen(p.ui, p.path, pos)
 }
 
 // showVolumePopup shows a vertical volume slider floating just above the speaker
